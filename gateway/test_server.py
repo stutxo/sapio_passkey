@@ -118,7 +118,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                     values[key] = value
         reader, writer = await asyncio.open_connection(
             "127.0.0.1", self.port, ssl=self.client_tls,
-            server_hostname="api.example.test" if self.client_tls else None)
+            server_hostname="127.0.0.1" if self.client_tls else None)
         try:
             header = f"{method} {path} HTTP/1.1\r\n" + "".join(
                 f"{key}: {value}\r\n" for key, value in values.items()) + "\r\n"
@@ -422,11 +422,11 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             cert, key = Path(directory) / "cert.pem", Path(directory) / "key.pem"
             await asyncio.to_thread(subprocess.run, [openssl, "req", "-x509", "-newkey", "rsa:2048",
-                "-nodes", "-days", "1", "-subj", "/CN=api.example.test",
-                "-addext", "subjectAltName=DNS:api.example.test", "-keyout", str(key), "-out", str(cert)],
+                "-nodes", "-days", "1", "-subj", "/CN=127.0.0.1",
+                "-addext", "subjectAltName=IP:127.0.0.1", "-keyout", str(key), "-out", str(cert)],
                 check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             args = server.parser().parse_args([
-                "--api-url", "https://api.example.test", "--origin", "https://owner.github.io",
+                "--api-url", "https://127.0.0.1", "--origin", "https://owner.github.io",
                 "--tls-cert", str(cert), "--tls-key", str(key),
                 "--upstream-port", str(self.oracle.sockets[0].getsockname()[1])])
             relay, context = server.configure(args)
@@ -437,7 +437,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             self.port = self.listener.getsockname()[1]
             self.acceptor = asyncio.create_task(server.accept_connections(self.listener, relay, context))
             self.client_tls = ssl.create_default_context(cafile=str(cert))
-            code, headers, body = await self.request(headers={"Host": "api.example.test", "Origin": relay.origin})
+            code, headers, body = await self.request(headers={"Host": "127.0.0.1", "Origin": relay.origin})
             self.assertEqual((code, body), (200, self.response))
             self.assert_cors(headers)
             # The four stalled handshakes consume admission, not four extra
@@ -481,10 +481,15 @@ class ConfigurationTests(unittest.TestCase):
                        "https://wallet.example.test:443", "https://wallet.example.test:0444",
                        "https://wallet.example.test:65536", "https://WALLET.example.test",
                        "https://user@wallet.example.test", "https://wallet.example.test\n",
-                       "http://wallet.example.test", "https://127.0.0.1", "null", "*"):
+                       "http://wallet.example.test", "null", "*"):
             for api, frontend in ((origin, "https://owner.github.io"), ("https://api.example.test", origin)):
                 with self.subTest(api=api, frontend=frontend), self.assertRaises(ValueError):
                     server.Relay(api, frontend, mode="https-proxy")
+
+    def test_ip_api_does_not_allow_ip_frontend(self):
+        for origin in ("https://127.0.0.1", "https://[::1]"):
+            with self.subTest(origin=origin), self.assertRaises(ValueError):
+                server.Relay("https://127.0.0.1", origin, mode="https-proxy")
 
     def test_plaintext_requires_both_loopback_origins_and_explicit_opt_in(self):
         for extra in ((), ("--https-proxy",), ("--allow-local-dev", "--listen", "0.0.0.0")):

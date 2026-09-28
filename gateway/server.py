@@ -118,7 +118,7 @@ def validate_response(data):
                 "unsupported oracle response")
 
 
-def validate_origin(origin, allow_local_dev):
+def validate_origin(origin, allow_local_dev, *, allow_ip=False):
     require(isinstance(origin, str) and origin == origin.lower()
             and not any(ord(char) <= 32 or ord(char) >= 127 for char in origin),
             "origin must be canonical ASCII")
@@ -132,17 +132,17 @@ def validate_origin(origin, allow_local_dev):
                 "development requires an explicit http://localhost or http://127.0.0.1 origin")
     else:
         require(parsed.scheme == "https", "production requires an HTTPS origin")
-        require(re.fullmatch(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
-                             r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", parsed.hostname)
-                and not parsed.hostname.endswith(".localhost"),
-                "production requires a DNS hostname")
         try:
-            ipaddress.ip_address(parsed.hostname)
+            address = ipaddress.ip_address(parsed.hostname)
         except ValueError:
-            pass
+            require(re.fullmatch(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+                                 r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", parsed.hostname)
+                    and not parsed.hostname.endswith(".localhost"),
+                    "production requires a DNS hostname or an API IP address")
         else:
-            raise ValueError("production requires a DNS hostname, not an IP")
-    expected_authority = parsed.hostname
+            require(allow_ip, "the frontend origin requires a DNS hostname, not an IP")
+            require(parsed.hostname == str(address), "API IP address must be canonical")
+    expected_authority = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
     if parsed.port is not None:
         require(1 <= parsed.port <= 65535 and parsed.port != (80 if allow_local_dev else 443),
                 "invalid origin port; omit the default port")
@@ -274,7 +274,7 @@ class Relay:
         require(mode in ("tls", "https-proxy", "local-dev"), "invalid gateway mode")
         self.mode = mode
         self.origin = origin
-        self.host = validate_origin(api_url, mode == "local-dev")
+        self.host = validate_origin(api_url, mode == "local-dev", allow_ip=True)
         validate_origin(origin, mode == "local-dev")
         self.upstream_host = str(ipaddress.ip_address(upstream_host))
         require(type(upstream_port) is int and 1 <= upstream_port <= 65535,
@@ -531,7 +531,7 @@ All requests/responses: 1 MiB body, 16 KiB headers, 4 admitted sockets,
 30 seconds total including TLS. Broadcasts and signing are never retried.
 No installation, static file serving, health/setup API, or deployment actions.
 """)
-    value.add_argument("--api-url", required=True, help="exact public API origin; HTTPS except explicit localhost development")
+    value.add_argument("--api-url", required=True, help="exact public API origin (DNS name or certified IP); HTTPS except explicit localhost development")
     value.add_argument("--origin", required=True, help="exact allowed frontend origin; HTTPS except explicit localhost development")
     value.add_argument("--listen", default="127.0.0.1", help="numeric listen IP; proxy and development require loopback")
     value.add_argument("--port", type=int, default=8081, help="listen port (default: 8081)")
