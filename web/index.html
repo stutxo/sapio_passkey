@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light dark">
+  <meta name="color-scheme" content="light">
   <title>Sapio · passkey onchain wallet</title>
   <link rel="stylesheet" href="./style.css">
   <script src="./app.js" type="module"></script>
@@ -11,16 +11,15 @@
 <body>
   <main>
     <header>
-      <p class="eyebrow">Sapio / passkey wallet</p>
+      <div class="header-row">
+        <p>Sapio / passkey wallet</p>
+        <button id="log-out" type="button" class="quiet" hidden disabled>Log out</button>
+      </div>
       <h1 id="wallet-title">Mutinynet wallet</h1>
-      <p class="intro">Receive and send test bitcoin with your passkey. Onchain only, with public history managed locally by BDK.</p>
-      <div class="badges"><span id="network-badge">Loading configuration…</span><span id="environment-badge">Signer identity not loaded</span></div>
+      <p id="network-badge">Loading configuration…</p>
     </header>
 
-    <aside class="notice" aria-label="Wallet safety limits">
-      <strong>Test bitcoin only. Not production custody.</strong>
-      <p>Use the network shown above and keep this exact wallet origin. Both your original passkey and the pinned signer are required; losing either has no recovery path.</p>
-    </aside>
+    <p class="approval-note">Test coins only, not production custody. Keep this exact origin. Losing your original passkey or the pinned signer has no recovery path.</p>
 
     <div class="status-bar">
       <p id="status" role="status" aria-live="polite">Loading the pinned static configuration…</p>
@@ -31,46 +30,45 @@
 
     <div id="wallet-app" aria-busy="true">
       <section id="passkey-panel" aria-labelledby="passkey-heading">
-        <div class="section-title"><h2 id="passkey-heading">Open your wallet</h2></div>
-        <p id="passkey-note" class="muted">Create a discoverable ES256 passkey using your device or password manager, or open an existing one. No Bitcoin keys to enter.</p>
-        <div class="wallet-actions">
-          <button id="create-passkey" type="button" disabled>Create passkey</button>
-          <button id="use-existing-passkey" type="button" class="secondary" aria-describedby="restore-note" disabled>Use existing passkey</button>
+        <h2 id="passkey-heading" tabindex="-1">Your wallet</h2>
+        <p id="passkey-note">Use your passkey to log in. New here? Start with Log in with passkey.</p>
+        <button id="login-passkey" type="button" aria-describedby="passkey-note" disabled>Log in with passkey</button>
+        <div id="new-wallet-panel" hidden>
+          <p id="new-wallet-note">No passkey was selected. You can try logging in again, or create a separate wallet if you are new. A new passkey cannot recover an existing wallet.</p>
+          <button id="create-passkey" type="button" aria-describedby="new-wallet-note" disabled>Create a new wallet</button>
         </div>
-        <p id="restore-note" class="approval-note">Opening an existing wallet asks for two passkey approvals, without signing or sending a transaction. Non-discoverable credentials cannot be opened this way.</p>
-        <p class="approval-note">The same address requires the same passkey, signer, policy and exact origin. Local regtest software signer identities are ephemeral.</p>
       </section>
 
-      <div class="cache-choice">
-        <label class="checkbox-label" for="remember-history">
-          <input id="remember-history" type="checkbox" autocomplete="off" aria-describedby="cache-note" disabled>
-          <span>Remember public wallet history on this device</span>
-        </label>
-        <p id="cache-note" class="approval-note">Optional and off by default. Stores public BDK history and signed transaction bytes in IndexedDB, never private keys. Reopening works without it. Uncheck while the wallet is open to remove its loaded cache; closing keeps any saved cache.</p>
-        <p id="cache-warning" class="notice" role="status" aria-live="polite" hidden></p>
-      </div>
+      <p id="cache-warning" class="notice" role="alert" hidden></p>
 
-      <section id="wallet-panel" aria-labelledby="receive-heading" hidden>
-        <div class="section-title"><h2 id="receive-heading" tabindex="-1">Receive & balance</h2></div>
+      <section id="wallet-panel" aria-labelledby="balance-heading" hidden>
+        <h2 id="balance-heading" tabindex="-1">Available balance</h2>
+        <dl class="available">
+          <dt>After local reservations</dt>
+          <dd id="balance-spendable">—</dd>
+        </dl>
+        <details>
+          <summary>Balance details</summary>
+          <dl class="balances">
+            <div><dt>Confirmed</dt><dd id="balance-confirmed">—</dd></div>
+            <div><dt>Pending · unconfirmed</dt><dd id="balance-pending">—</dd></div>
+            <div><dt>Immature coinbase</dt><dd id="balance-immature">—</dd></div>
+          </dl>
+          <p class="approval-note">Only confirmed coins are spendable. Coinbase outputs need 100 confirmations. Signed outgoing transactions reserve their inputs even if the indexer temporarily omits them.</p>
+        </details>
+        <p id="sync-note" class="approval-note">Balance has not been refreshed.</p>
+        <button id="refresh-balance" type="button" class="secondary" disabled>Refresh</button>
+        <h2 id="receive-heading" tabindex="-1">Receive</h2>
         <label for="receive-address">Your single receive address</label>
         <div class="address-row">
           <input id="receive-address" class="mono" type="text" readonly spellcheck="false" aria-describedby="receive-note">
           <button id="copy-address" type="button" class="secondary" disabled>Copy address</button>
         </div>
         <p id="receive-note" class="approval-note">One address for receiving and change. Send coins only on the network shown above.</p>
-        <dl class="balances" aria-label="Wallet balances">
-          <div><dt>Available · after local reservations</dt><dd id="balance-spendable">—</dd></div>
-          <div><dt>Confirmed balance</dt><dd id="balance-confirmed">—</dd></div>
-          <div><dt>Pending · unconfirmed</dt><dd id="balance-pending">—</dd></div>
-          <div><dt>Immature coinbase</dt><dd id="balance-immature">—</dd></div>
-        </dl>
-        <p id="sync-note" class="approval-note">Balance has not been refreshed.</p>
-        <button id="refresh-balance" type="button" class="secondary" disabled>Refresh history & balance</button>
-        <p class="approval-note">Only confirmed coins are spendable. Coinbase outputs need 100 confirmations. Signed outgoing transactions reserve their inputs even if the indexer temporarily omits them.</p>
       </section>
 
       <section id="payment-panel" aria-labelledby="payment-heading" hidden>
-        <div class="section-title"><h2 id="payment-heading">Send bitcoin</h2></div>
+        <div class="section-title"><h2 id="payment-heading">Send</h2></div>
         <form id="payment-form" autocomplete="off">
           <label for="recipient">Recipient address</label>
           <input id="recipient" type="text" class="mono" placeholder="Paste a recipient address on this network" maxlength="128" autocapitalize="none" spellcheck="false" required disabled>
@@ -146,7 +144,7 @@
           <button id="retry-broadcast" type="button" hidden disabled>Retry broadcast · same transaction</button>
           <button id="discard-result" type="button" class="quiet" hidden disabled>Dismiss result</button>
         </div>
-        <p id="broadcast-warning" class="approval-note">A submitted transaction cannot be cancelled here. Retry submits only these same signed bytes, never a second payment. Dismissing the result does not release known outgoing input reservations. Save the transaction ID or bytes before closing if needed; public caching is optional.</p>
+        <p id="broadcast-warning" class="approval-note">A submitted transaction cannot be cancelled here. Retry submits only these same signed bytes, never a second payment. Dismissing the result does not release known outgoing input reservations. Signed bytes are cached on this device by default; if storage fails, save the transaction ID and bytes before logging out.</p>
         <details id="result-details">
           <summary>Inspect or copy the signed transaction</summary>
           <label for="transaction-hex">Finalized transaction · hex</label>
@@ -158,7 +156,7 @@
         </details>
       </section>
       <section id="history-panel" aria-labelledby="history-heading" hidden>
-        <div class="section-title"><h2 id="history-heading">Transaction history</h2></div>
+        <div class="section-title"><h2 id="history-heading">History</h2></div>
         <p id="history-note" class="approval-note">Refresh to load your wallet history.</p>
         <ol id="history-list" class="history-list" aria-describedby="history-note"></ol>
         <button id="history-more" type="button" class="secondary" hidden>Show 25 more</button>
@@ -170,15 +168,13 @@
 
     <details class="trust-notes">
       <summary>Trust and privacy limits — read before funding</summary>
-      <p>This is an experimental test-coin wallet, not a production custody assurance. This page, its hosting and its WASM assets must be trusted to display and authorize the right payment. Authenticator attestation is not requested. Private passkey material stays with your authenticator. Public wallet details remain in this tab unless you explicitly enable public-history caching.</p>
-      <p>Both your original passkey and the configured oracle are needed to spend. The operator must separately verify the Nitro identity, attestation and exact policy digest before pinning them. This page does not check TEE attestation and never automatically trusts a newly fetched signer identity. Local regtest software signers have no enclave assurance.</p>
+      <p>This is an experimental test-coin wallet, not a production custody assurance. This page, its hosting and its WASM assets must be trusted to display and authorize the right payment. Authenticator attestation is not requested. Private passkey material stays with your authenticator.</p>
+      <p>Public BDK history and signed transaction bytes are cached automatically in this browser's IndexedDB, never private keys. Anyone with access to this browser's storage may be able to read those public details. Logging out clears this tab's active wallet and releases its tab lock, but preserves your passkey and saved history. Reopening still requires your original passkey. Browser storage can be cleared or unavailable; it is not a backup.</p>
+      <p id="environment-badge">Signer identity not loaded</p>
+      <p>Both your original passkey and the configured oracle are needed to spend. The operator must separately verify the Nitro identity, attestation and exact policy digest before pinning them. This page does not check TEE attestation and never automatically trusts a newly fetched signer identity. Local regtest software signers have no enclave assurance and their identities are ephemeral.</p>
       <p>This wallet reuses one address for receiving and change, making your activity linkable. The configured gateway (<span id="api-origin" class="mono">not loaded</span>) and chain indexer see your requests and transactions. The indexer is trusted for availability, completeness, spentness and chain anchors. BDK tracks transaction history, balances and replacements; the wallet verifies funding transaction IDs and outputs, policy authorizations, signatures and exact finalization. This is not SPV or full-node validation. The indexer can omit transactions or report stale chain information, and reorganizations can change confirmations.</p>
-      <p>Your exact origin and hostname are part of the policy. Keep using this same origin and discoverable passkey. Opening an existing wallet reconstructs public details with two no-spend approvals before any optional history cache is read. This does not replace either factor or provide recovery. The policy has no assertion expiry or replay counter, even though this page uses fresh signing challenges. Web Locks prevent this origin's tabs from concurrently opening the same wallet; they cannot coordinate other devices. Without a public cache, reopening reconstructs chain-visible history but cannot recover signed bytes that never reached the network.</p>
+      <p>Your exact origin and hostname are part of the policy. Keep using this same origin and discoverable ES256 passkey. Opening an existing wallet reconstructs public details with two no-spend approvals before its context-bound history cache is read. Non-discoverable credentials cannot be opened this way. This does not replace either factor or provide recovery. The policy has no assertion expiry or replay counter, even though this page uses fresh signing challenges. Web Locks prevent this origin's tabs from concurrently opening the same wallet; they cannot coordinate other devices. If the cache is lost, reopening reconstructs chain-visible history but cannot recover signed bytes that never reached the network.</p>
     </details>
-    <footer>
-      <button id="close-wallet" type="button" class="quiet" aria-describedby="close-note" disabled>Close wallet</button>
-      <p id="close-note">Clears this tab's wallet and transaction state and releases its tab lock. Your passkey and any opted-in public cache remain. Closing cannot cancel a broadcast.</p>
-    </footer>
   </main>
 </body>
 </html>
