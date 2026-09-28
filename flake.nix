@@ -17,7 +17,8 @@
         };
       in {
         devShells.default = pkgs.mkShell {
-          packages = with pkgs; [ rust stdenv.cc llvmPackages_21.clang llvmPackages_21.llvm wasm-bindgen-cli_0_2_114 python3 openssl git ];
+          # The native Clang wrapper injects host-only hardening flags into WASM builds.
+          packages = with pkgs; [ rust stdenv.cc llvmPackages_21.clang-unwrapped llvmPackages_21.llvm wasm-bindgen-cli_0_2_114 python3 openssl git ];
         };
       });
 }
