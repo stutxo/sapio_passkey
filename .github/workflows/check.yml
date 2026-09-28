@@ -21,7 +21,7 @@ jobs:
       - name: Fetch the two locked dependency graphs
         run: |
           nix develop --no-update-lock-file -c cargo fetch --locked
-          nix develop --no-update-lock-file -c cargo fetch --manifest-path policy/Cargo.toml --locked --target wasm32-unknown-unknown
+          nix develop --no-update-lock-file -c cargo fetch --manifest-path policy/Cargo.toml --locked
       - name: Verify wallet and gateway behavior
         run: |
           nix develop --no-update-lock-file -c cargo test --workspace --locked --offline -- --test-threads=2
