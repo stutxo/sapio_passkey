@@ -1,0 +1,25 @@
+[package]
+name = "sapio-passkey-predicate"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.98.1"
+license = "MPL-2.0"
+publish = false
+
+# Keep host dependencies/features out of the inline evaluator's identity.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa"] }
+serde = { version = "=1.0.228", default-features = false, features = ["alloc", "derive"] }
+serde_json = { version = "=1.0.150", default-features = false, features = ["alloc"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

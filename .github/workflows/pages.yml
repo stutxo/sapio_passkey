@@ -1,0 +1,49 @@
+name: Publish Mutinynet wallet to Pages
+
+on:
+  workflow_dispatch:
+    inputs:
+      api_url:
+        description: "Actual HTTPS gateway origin, with TLS and CORS configured for this Pages origin"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - uses: actions/configure-pages@v5
+      - name: Fetch the locked dependencies
+        run: |
+          nix develop --no-update-lock-file -c cargo fetch --locked --target wasm32-unknown-unknown
+          nix develop --no-update-lock-file -c cargo fetch --manifest-path policy/Cargo.toml --locked --target wasm32-unknown-unknown
+      - name: Build the pinned wallet and policy
+        run: nix develop --no-update-lock-file -c python3 scripts/build.py
+      - name: Package the configured Mutinynet wallet
+        env:
+          API_URL: ${{ inputs.api_url }}
+        run: nix develop --no-update-lock-file -c python3 scripts/package.py --api-url "$API_URL" --out dist
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+      - name: Publish Pages artifact
+        id: deployment
+        uses: actions/deploy-pages@v4

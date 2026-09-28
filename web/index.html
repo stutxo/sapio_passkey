@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Sapio · passkey onchain wallet</title>
+  <link rel="stylesheet" href="./style.css">
+  <script src="./app.js" type="module"></script>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">Sapio / passkey wallet</p>
+      <h1 id="wallet-title">Mutinynet wallet</h1>
+      <p class="intro">Receive and send test bitcoin with your passkey. Onchain only, with public history managed locally by BDK.</p>
+      <div class="badges"><span id="network-badge">Loading configuration…</span><span id="environment-badge">Signer identity not loaded</span></div>
+    </header>
+
+    <aside class="notice" aria-label="Wallet safety limits">
+      <strong>Test bitcoin only. Not production custody.</strong>
+      <p>Use the network shown above and keep this exact wallet origin. Both your original passkey and the pinned signer are required; losing either has no recovery path.</p>
+    </aside>
+
+    <div class="status-bar">
+      <p id="status" role="status" aria-live="polite">Loading the pinned static configuration…</p>
+      <button id="cancel-operation" type="button" class="quiet" hidden>Cancel operation</button>
+    </div>
+    <p id="error" class="error" role="alert" hidden></p>
+    <noscript><p class="error">Enable JavaScript to use WebAuthn and the local wallet WASM module.</p></noscript>
+
+    <div id="wallet-app" aria-busy="true">
+      <section id="passkey-panel" aria-labelledby="passkey-heading">
+        <div class="section-title"><h2 id="passkey-heading">Open your wallet</h2></div>
+        <p id="passkey-note" class="muted">Create a discoverable ES256 passkey using your device or password manager, or open an existing one. No Bitcoin keys to enter.</p>
+        <div class="wallet-actions">
+          <button id="create-passkey" type="button" disabled>Create passkey</button>
+          <button id="use-existing-passkey" type="button" class="secondary" aria-describedby="restore-note" disabled>Use existing passkey</button>
+        </div>
+        <p id="restore-note" class="approval-note">Opening an existing wallet asks for two passkey approvals, without signing or sending a transaction. Non-discoverable credentials cannot be opened this way.</p>
+        <p class="approval-note">The same address requires the same passkey, signer, policy and exact origin. Local regtest software signer identities are ephemeral.</p>
+      </section>
+
+      <div class="cache-choice">
+        <label class="checkbox-label" for="remember-history">
+          <input id="remember-history" type="checkbox" autocomplete="off" aria-describedby="cache-note" disabled>
+          <span>Remember public wallet history on this device</span>
+        </label>
+        <p id="cache-note" class="approval-note">Optional and off by default. Stores public BDK history and signed transaction bytes in IndexedDB, never private keys. Reopening works without it. Uncheck while the wallet is open to remove its loaded cache; closing keeps any saved cache.</p>
+        <p id="cache-warning" class="notice" role="status" aria-live="polite" hidden></p>
+      </div>
+
+      <section id="wallet-panel" aria-labelledby="receive-heading" hidden>
+        <div class="section-title"><h2 id="receive-heading" tabindex="-1">Receive & balance</h2></div>
+        <label for="receive-address">Your single receive address</label>
+        <div class="address-row">
+          <input id="receive-address" class="mono" type="text" readonly spellcheck="false" aria-describedby="receive-note">
+          <button id="copy-address" type="button" class="secondary" disabled>Copy address</button>
+        </div>
+        <p id="receive-note" class="approval-note">One address for receiving and change. Send coins only on the network shown above.</p>
+        <dl class="balances" aria-label="Wallet balances">
+          <div><dt>Available · after local reservations</dt><dd id="balance-spendable">—</dd></div>
+          <div><dt>Confirmed balance</dt><dd id="balance-confirmed">—</dd></div>
+          <div><dt>Pending · unconfirmed</dt><dd id="balance-pending">—</dd></div>
+          <div><dt>Immature coinbase</dt><dd id="balance-immature">—</dd></div>
+        </dl>
+        <p id="sync-note" class="approval-note">Balance has not been refreshed.</p>
+        <button id="refresh-balance" type="button" class="secondary" disabled>Refresh history & balance</button>
+        <p class="approval-note">Only confirmed coins are spendable. Coinbase outputs need 100 confirmations. Signed outgoing transactions reserve their inputs even if the indexer temporarily omits them.</p>
+      </section>
+
+      <section id="payment-panel" aria-labelledby="payment-heading" hidden>
+        <div class="section-title"><h2 id="payment-heading">Send bitcoin</h2></div>
+        <form id="payment-form" autocomplete="off">
+          <label for="recipient">Recipient address</label>
+          <input id="recipient" type="text" class="mono" placeholder="Paste a recipient address on this network" maxlength="128" autocapitalize="none" spellcheck="false" required disabled>
+          <div class="form-grid">
+            <div>
+              <label for="amount-sats">Amount · sats</label>
+              <input id="amount-sats" type="text" inputmode="numeric" pattern="[1-9][0-9]*" maxlength="16" placeholder="Whole satoshis" aria-describedby="amount-note" required disabled>
+              <button id="send-max" type="button" class="quiet" aria-pressed="false" aria-describedby="amount-note" disabled>Send max</button>
+            </div>
+            <div>
+              <label for="fee-rate">Fee rate · sat/vB</label>
+              <input id="fee-rate" type="text" inputmode="numeric" pattern="[1-9][0-9]*" maxlength="4" value="1" aria-describedby="fee-note" required disabled>
+            </div>
+          </div>
+          <p id="amount-note" class="approval-note">Whole satoshis. The network fee is added to this amount.</p>
+          <p id="fee-note" class="approval-note">Manual starting rate: 1 sat/vB. Refresh asks the indexer for an editable suggestion.</p>
+          <button id="review-payment" type="submit" disabled>Review payment</button>
+        </form>
+        <details>
+          <summary>Wallet limits</summary>
+          <p class="approval-note">Up to 16 inputs per transaction and 1–1,000 sat/vB. BDK chooses eligible confirmed funding and calculates fees; small leftover change can be added to the fee instead of creating dust. History is paginated here, never silently truncated. Oversized signer or indexer responses are rejected explicitly.</p>
+        </details>
+      </section>
+
+      <section id="bump-panel" aria-labelledby="bump-heading" hidden>
+        <div class="section-title"><h2 id="bump-heading">Increase transaction fee</h2></div>
+        <p class="approval-note">Original transaction</p>
+        <p id="bump-txid" class="mono"></p>
+        <p class="approval-note">The original recipient and payment amount stay unchanged, including a payment back to this wallet. BDK may reduce change or add confirmed funding. Review the replacement's total fee, not just its increase.</p>
+        <form id="bump-form" autocomplete="off">
+          <label for="bump-fee-rate">New fee rate · sat/vB</label>
+          <input id="bump-fee-rate" type="text" inputmode="numeric" pattern="[1-9][0-9]*" maxlength="4" required disabled>
+          <div class="wallet-actions">
+            <button id="review-bump" type="submit" disabled>Review fee replacement</button>
+            <button id="cancel-bump" type="button" class="secondary" disabled>Back to new payment</button>
+          </div>
+        </form>
+      </section>
+
+      <section id="review" aria-labelledby="review-heading" hidden>
+        <div class="section-title"><h2 id="review-heading" tabindex="-1">Review payment</h2></div>
+        <div id="review-details" hidden>
+          <dl class="payment">
+            <dt>Recipient</dt><dd id="review-recipient" class="mono"></dd>
+            <dt>Payment amount</dt><dd id="review-amount" class="amount"></dd>
+            <dt>Network fee</dt><dd id="review-fee"></dd>
+            <dt>Payment + fee</dt><dd id="review-total" class="amount"></dd>
+            <dt>Transaction size</dt><dd id="review-size"></dd>
+            <dt>Change</dt><dd id="review-change"></dd>
+            <dt>Change address</dt><dd id="review-change-address" class="mono"></dd>
+            <dt>Passkey approvals</dt><dd id="review-inputs"></dd>
+            <dt>Replaces</dt><dd id="review-replaces" class="mono"></dd>
+          </dl>
+          <details>
+            <summary>Exact transaction and selected inputs</summary>
+            <p class="approval-note">Unsigned transaction ID</p>
+            <p id="review-txid" class="mono"></p>
+            <ul id="review-funding" class="mono funding-list"></ul>
+          </details>
+          <p class="approval-note">Check the address, amount and exact fee. Small change may be added to the fee instead of creating a dust output. Editing a payment or refreshing invalidates this review.</p>
+          <p class="approval-note"><strong>Approve & sign authorizes this exact transaction; broadcast is a separate button.</strong> Each input needs a separate passkey approval and signer request, one at a time. Your passkey prompt verifies you, not the Bitcoin address. Cancelling during signing discards partial responses; retrying keeps the reviewed transaction but requires every approval again with a fresh nonce.</p>
+        </div>
+        <button id="send-payment" type="button" disabled>Approve & sign</button>
+      </section>
+
+      <section id="result" class="result" aria-labelledby="result-heading" hidden>
+        <h2 id="result-heading" tabindex="-1">Transaction result</h2>
+        <p id="result-note"></p>
+        <label for="result-txid">Verified transaction ID</label>
+        <input id="result-txid" class="mono" type="text" readonly spellcheck="false">
+        <p><a id="explorer-link" target="_blank" rel="noopener noreferrer" hidden>Check this transaction on Mutinynet ↗</a></p>
+        <div class="wallet-actions">
+          <button id="retry-broadcast" type="button" hidden disabled>Retry broadcast · same transaction</button>
+          <button id="discard-result" type="button" class="quiet" hidden disabled>Dismiss result</button>
+        </div>
+        <p id="broadcast-warning" class="approval-note">A submitted transaction cannot be cancelled here. Retry submits only these same signed bytes, never a second payment. Dismissing the result does not release known outgoing input reservations. Save the transaction ID or bytes before closing if needed; public caching is optional.</p>
+        <details id="result-details">
+          <summary>Inspect or copy the signed transaction</summary>
+          <label for="transaction-hex">Finalized transaction · hex</label>
+          <textarea id="transaction-hex" class="mono" rows="5" readonly spellcheck="false"></textarea>
+          <div id="signed-psbt-field">
+            <label for="signed-psbt">Signed PSBT · base64</label>
+            <textarea id="signed-psbt" class="mono" rows="5" readonly spellcheck="false"></textarea>
+          </div>
+        </details>
+      </section>
+      <section id="history-panel" aria-labelledby="history-heading" hidden>
+        <div class="section-title"><h2 id="history-heading">Transaction history</h2></div>
+        <p id="history-note" class="approval-note">Refresh to load your wallet history.</p>
+        <ol id="history-list" class="history-list" aria-describedby="history-note"></ol>
+        <button id="history-more" type="button" class="secondary" hidden>Show 25 more</button>
+        <div id="outbox-extra" class="wallet-actions" hidden></div>
+        <p class="approval-note">Increase fee replaces a known unconfirmed outgoing transaction using RBF. It preserves the original recipient and amount, requires a new review and fresh approvals, and is not a cancellation.</p>
+      </section>
+
+    </div>
+
+    <details class="trust-notes">
+      <summary>Trust and privacy limits — read before funding</summary>
+      <p>This is an experimental test-coin wallet, not a production custody assurance. This page, its hosting and its WASM assets must be trusted to display and authorize the right payment. Authenticator attestation is not requested. Private passkey material stays with your authenticator. Public wallet details remain in this tab unless you explicitly enable public-history caching.</p>
+      <p>Both your original passkey and the configured oracle are needed to spend. The operator must separately verify the Nitro identity, attestation and exact policy digest before pinning them. This page does not check TEE attestation and never automatically trusts a newly fetched signer identity. Local regtest software signers have no enclave assurance.</p>
+      <p>This wallet reuses one address for receiving and change, making your activity linkable. The configured gateway (<span id="api-origin" class="mono">not loaded</span>) and chain indexer see your requests and transactions. The indexer is trusted for availability, completeness, spentness and chain anchors. BDK tracks transaction history, balances and replacements; the wallet verifies funding transaction IDs and outputs, policy authorizations, signatures and exact finalization. This is not SPV or full-node validation. The indexer can omit transactions or report stale chain information, and reorganizations can change confirmations.</p>
+      <p>Your exact origin and hostname are part of the policy. Keep using this same origin and discoverable passkey. Opening an existing wallet reconstructs public details with two no-spend approvals before any optional history cache is read. This does not replace either factor or provide recovery. The policy has no assertion expiry or replay counter, even though this page uses fresh signing challenges. Web Locks prevent this origin's tabs from concurrently opening the same wallet; they cannot coordinate other devices. Without a public cache, reopening reconstructs chain-visible history but cannot recover signed bytes that never reached the network.</p>
+    </details>
+    <footer>
+      <button id="close-wallet" type="button" class="quiet" aria-describedby="close-note" disabled>Close wallet</button>
+      <p id="close-note">Clears this tab's wallet and transaction state and releases its tab lock. Your passkey and any opted-in public cache remain. Closing cannot cancel a broadcast.</p>
+    </footer>
+  </main>
+</body>
+</html>

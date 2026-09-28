@@ -1,0 +1,11 @@
+/target/
+/policy/target/
+/dist/
+/.local/
+/web/pkg/
+**/__pycache__/
+*.pyc
+*.pem
+*.key
+.env
+.env.*

@@ -1,0 +1,32 @@
+name: Wallet and policy checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Fetch the two locked dependency graphs
+        run: |
+          nix develop --no-update-lock-file -c cargo fetch --locked
+          nix develop --no-update-lock-file -c cargo fetch --manifest-path policy/Cargo.toml --locked --target wasm32-unknown-unknown
+      - name: Verify wallet and gateway behavior
+        run: |
+          nix develop --no-update-lock-file -c cargo test --workspace --locked --offline -- --test-threads=2
+          nix develop --no-update-lock-file -c python3 -m unittest discover -s gateway -p test_server.py
+      - name: Build and reproduce policy and browser artifacts
+        run: |
+          nix develop --no-update-lock-file -c python3 scripts/build.py
+          nix develop --no-update-lock-file -c python3 scripts/build.py --check

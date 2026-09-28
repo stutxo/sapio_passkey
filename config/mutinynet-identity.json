@@ -1,0 +1,32 @@
+{
+  "mode": "nitro",
+  "protocol": "sapio-tee/program-oracle/1",
+  "settings": {
+    "blockhash": "000000cd4b6dc9d1f67bf145e505087437ee2560999e31cad7eb496a01285e47",
+    "key_id": "arn:aws:kms:us-east-1:493031039834:key/fb60b8df-f7d5-47f6-9ece-95b4d262aa07",
+    "network": "signet"
+  },
+  "signing": {
+    "inline_evaluators": [
+      {
+        "id": "0000000000000000000000000000000000000000000000000000000000000000",
+        "wasm_version": 1
+      },
+      {
+        "id": "0000000000000000000000000000000000000000000000000000000000000002",
+        "wasm_version": 2
+      }
+    ],
+    "max_connections": 4,
+    "protocol": "SignProgramV1",
+    "registered_evaluators": [
+      {
+        "id": "c99794a01b53f5d41775d7f01e6d13afa072ab113540109267846af40d159111",
+        "name": "pay-at-least/v1",
+        "wasm_version": 1
+      }
+    ],
+    "request_timeout_secs": 30
+  },
+  "xpub": "tpubD6NzVbkrYhZ4XupSsQvBYv8A3bYYi5SBpvFWTxWr8cBTc4HqjJ9QAngs2wEinpq1kFXdhk2dQzLVaMFA912GKkwSMumpnsWLo2MEicXEmmz"
+}
