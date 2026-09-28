@@ -133,7 +133,8 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart={CERTBOT} renew --non-interactive {common} --deploy-hook "/usr/bin/systemctl try-restart sapio-passkey-gateway.service"
+# The timer supplies jitter; a second Certbot sleep can exceed the job deadline.
+ExecStart={CERTBOT} renew --non-interactive --no-random-sleep-on-renew {common} --deploy-hook "/usr/bin/systemctl try-restart sapio-passkey-gateway.service"
 Environment=PYTHONDONTWRITEBYTECODE=1
 TimeoutStartSec=300
 UMask=0077
@@ -234,7 +235,7 @@ def main():
     command('/usr/bin/systemctl', 'restart', 'sapio-passkey-gateway.service')
     command('/usr/bin/systemctl', 'enable', '--now', 'sapio-passkey-renew.timer')
     command('/usr/bin/systemctl', 'is-active', '--quiet', 'sapio-passkey-gateway.service', 'sapio-passkey-renew.timer')
-    command(CERTBOT, 'renew', '--non-interactive', *common, '--dry-run', '--run-deploy-hooks',
+    command(CERTBOT, 'renew', '--non-interactive', '--no-random-sleep-on-renew', *common, '--dry-run', '--run-deploy-hooks',
             '--deploy-hook', '/usr/bin/systemctl try-restart sapio-passkey-gateway.service')
     ready(ip, args.origin)
     print(f'Gateway installed at https://{ip}; certificate renewal and gateway reload verified.')
