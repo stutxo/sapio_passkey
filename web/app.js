@@ -17,6 +17,7 @@ const state = {
   resultStatus: null, controller: null, busy: false, phase: null,
   requestSent: false, credentialCreated: false, feeEdited: false, sendMax: false,
   bumpTxid: null, historyLimit: 25, releaseLock: null, cacheKey: null, credentials: new Map(),
+  accountId: null, hasAccount: false, accountStorage: false,
 };
 
 function requireThat(condition, message) {
@@ -249,14 +250,65 @@ async function registryIdentity(credentialId, identity) {
   return registered;
 }
 
+function credentialPrefix() {
+  return `${JSON.stringify([ORIGIN, RP_ID, state.apiUrl, state.config.network,
+    state.config.genesis_hash, state.config.xpub, state.config.module_sha256]).slice(0, -1)},`;
+}
+
+function credentialRecord(value, credentialId) {
+  const record = object(value, "Saved public credential");
+  requireThat(Object.keys(record).length === 2 && typeof record.pending_registration === "boolean",
+    "Saved public credential metadata is invalid.");
+  const identity = validateIdentity(record.identity);
+  requireThat(credentialId === undefined || identity.credential_id === credentialId,
+    "Saved public credential ID does not match the selected passkey.");
+  return freeze({ identity, pending_registration: record.pending_registration });
+}
+
+async function recognizeAccount() {
+  try {
+    // A real credential ID is nonempty; the empty slot remembers this account.
+    const remembered = await cacheOperation("read", undefined, "");
+    const records = remembered === undefined
+      ? await cacheOperation("list", undefined, "") : [remembered];
+    checkContext();
+    const saved = records.map((record) => credentialRecord(record));
+    state.accountStorage = true;
+    if (saved.length) {
+      state.hasAccount = true;
+      if (saved.length === 1) state.accountId = saved[0].identity.credential_id;
+      for (const record of saved) state.credentials.set(record.identity.credential_id, record);
+    }
+  } catch (error) {
+    if (signal().aborted) throw error;
+    state.accountStorage = false;
+    cacheWarning(`Could not recognize the saved account: ${explainError(error)} Use your existing passkey to unlock it. First-time setup requires readable browser storage.`);
+  }
+}
+
+async function enterAccount(operation) {
+  checkContext();
+  await navigator.locks.request(`sapio-passkey-account:${credentialPrefix()}`,
+    { mode: "exclusive", ifAvailable: true }, async (lock) => {
+      requireThat(lock, "Your passkey account is being opened in another tab. Finish there before continuing.");
+      await recognizeAccount();
+      checkContext();
+      await operation();
+    });
+}
+
 async function saveCredential(identity, pendingRegistration) {
+  requireThat(!state.accountId || state.accountId === identity.credential_id,
+    "Use the passkey already associated with this wallet account.");
+  state.accountId = identity.credential_id;
+  state.hasAccount = true;
   const record = freeze({ identity, pending_registration: pendingRegistration });
   // Keep the native create() public key even if browser storage or enrollment fails.
   state.credentials.set(identity.credential_id, record);
   try {
     await cacheOperation("write", record, identity.credential_id);
   } catch (error) {
-    cacheWarning(`Could not save public credential metadata: ${explainError(error)} This tab retains it. Registered wallets can still log in through the gateway. If setup is incomplete, keep this tab open and retry Log in with passkey.`);
+    cacheWarning(`Could not save public credential metadata: ${explainError(error)} This tab remembers your account. You can still unlock a registered account through the gateway. If setup is incomplete, keep this tab open and retry with the same passkey.`);
   }
 }
 
@@ -270,13 +322,9 @@ async function pendingCredential(credentialId) {
     }
   }
   if (record === undefined) return null;
-  object(record, "Saved public credential");
-  requireThat(Object.keys(record).length === 2 && typeof record.pending_registration === "boolean",
-    "Saved public credential metadata is invalid.");
-  const identity = validateIdentity(record.identity);
-  requireThat(identity.credential_id === credentialId, "Saved public credential ID does not match the selected passkey.");
-  state.credentials.set(credentialId, freeze(record));
-  return record.pending_registration ? identity : null;
+  record = credentialRecord(record, credentialId);
+  state.credentials.set(credentialId, record);
+  return record.pending_registration ? record.identity : null;
 }
 
 async function deriveWallet(publicKey) {
@@ -313,7 +361,7 @@ async function acceptWallet(identity, opened, note) {
   applySnapshot(opened.snapshot);
   renderReceiveQr($("receive-qr"), wallet.address);
   state.credentialCreated = false;
-  resetNewWalletOffer();
+  $("setup-panel").open = false;
   state.identity = identity;
   $("passkey-note").textContent = note;
   $("receive-address").value = wallet.address;
@@ -363,8 +411,8 @@ function cacheOperation(action, value, credentialId) {
   requireThat(credential ? state.config && state.apiUrl : state.releaseLock && state.cacheKey,
     "Public storage requires a pinned context, and wallet history requires its exclusive tab lock.");
   const storeName = credential ? "credentials" : "wallets";
-  const key = credential ? JSON.stringify([ORIGIN, RP_ID, state.apiUrl, state.config.network,
-    state.config.genesis_hash, state.config.xpub, state.config.module_sha256, credentialId]) : state.cacheKey;
+  const prefix = credential ? credentialPrefix() : null;
+  const key = credential ? `${prefix}${JSON.stringify(credentialId)}]` : state.cacheKey;
   return new Promise((resolve, reject) => {
     let db;
     let transaction;
@@ -397,9 +445,12 @@ function cacheOperation(action, value, credentialId) {
       if (settled) { db.close(); return; }
       db.onversionchange = () => db.close();
       try {
-        transaction = db.transaction(storeName, action === "read" ? "readonly" : "readwrite");
+        transaction = db.transaction(storeName, action === "write" ? "readwrite" : "readonly");
         const store = transaction.objectStore(storeName);
-        const request = action === "read" ? store.get(key) : store.put(value, key);
+        const request = action === "list"
+          ? store.getAll(IDBKeyRange.bound(prefix, `${prefix}\uffff`), 2)
+          : action === "read" ? store.get(key) : store.put(value, key);
+        if (credential && action === "write") store.put(value, `${prefix}""]`);
         transaction.oncomplete = () => finish(null, request.result);
         transaction.onabort = () => finish(transaction.error || new Error("Public browser storage was interrupted."));
         transaction.onerror = () => finish(transaction.error || new Error("Public browser storage failed."));
@@ -737,33 +788,27 @@ async function authenticatorData(bytes, registration = false) {
   if (!registration) requireThat((flags & 0xc0) === 0, "Assertion extensions or attestation data are not supported.");
 }
 
-function resetNewWalletOffer() {
-  $("new-wallet-panel").hidden = true;
-  $("new-wallet-note").textContent = "";
-}
-
-async function createPasskey() {
+async function setupPasskey() {
   checkContext();
-  requireThat(!state.identity, "Log out before creating another passkey.");
-  requireThat(!state.credentialCreated && !$("new-wallet-panel").hidden, "Log in with your passkey before choosing to create a new wallet.");
-  if (!window.confirm("Create a separate new wallet and passkey? This will not open an existing wallet. Its public credential ID and public key will be registered with the gateway.")) {
-    setStatus("New wallet creation cancelled. Log in with an existing passkey instead.");
-    return;
-  }
-  resetNewWalletOffer();
+  requireThat(state.accountStorage, "Enable browser storage before first-time passkey setup so this browser can remember your account.");
+  requireThat(!state.identity && !state.hasAccount && !state.credentialCreated,
+    "This wallet already has a passkey account. Unlock it with the same passkey instead of setting up another.");
+  $("setup-panel").open = false;
   requireThat(typeof PublicKeyCredential !== "undefined" && navigator.credentials?.create, "This browser does not support passkey creation.");
   state.phase = "opening";
   const challenge = crypto.getRandomValues(new Uint8Array(32));
   const userId = crypto.getRandomValues(new Uint8Array(32));
   const credential = await navigator.credentials.create({ publicKey: {
     rp: { id: RP_ID, name: `Sapio ${state.chain === "mutinynet" ? "Mutinynet" : "regtest"} wallet` },
-    user: { id: userId, name: `sapio-${base64url(userId).slice(0, 12)}`, displayName: "Sapio test-coin wallet" },
+    user: { id: userId, name: "Sapio wallet", displayName: "Sapio wallet" },
     challenge, pubKeyCredParams: [{ type: "public-key", alg: -7 }],
     authenticatorSelection: { residentKey: "required", requireResidentKey: true, userVerification: "required" },
     extensions: { credProps: true }, attestation: "none", timeout: 60000,
   }, signal: signal() });
   state.credentialCreated = true;
+  state.hasAccount = true;
   const id = credentialBytes(credential);
+  state.accountId = hex(id);
   requireThat(credential.getClientExtensionResults().credProps?.rk !== false,
     "The authenticator did not create the required discoverable passkey. No receive wallet has been opened.");
   const response = credential.response;
@@ -786,7 +831,7 @@ async function createPasskey() {
   await saveCredential(identity, false);
   checkContext();
   const wallet = await deriveWallet(publicKey);
-  await acceptWallet(identity, wallet, "Your public identity is registered. Use this passkey on this exact origin to log in again.");
+  await acceptWallet(identity, wallet, "Your passkey account is ready. This browser will remember it when you return.");
   state.phase = "sync";
   await syncWallet();
 }
@@ -814,27 +859,20 @@ async function assertion(challenge, expectedId) {
 
 async function loginPasskey() {
   checkContext();
-  requireThat(!state.identity, "Log out before opening another wallet.");
-  resetNewWalletOffer();
+  requireThat(!state.identity, "Your wallet account is already open.");
+  $("setup-panel").open = false;
   state.phase = "login";
   const nonce = hex(crypto.getRandomValues(new Uint8Array(32)));
   const result = object(await walletCall("login_challenge", state.context, { nonce }, signal()), "Login challenge");
   requireThat(Object.keys(result).length === 1 && Object.hasOwn(result, "challenge"),
     "The wallet returned an invalid login challenge.");
   const challenge = unhex(result.challenge, "Login challenge", 32);
-  setStatus("Choose and approve your passkey to log in. No transaction is signed.");
-  let approval;
-  try {
-    approval = await assertion(challenge);
-  } catch (error) {
-    if (error?.name !== "NotAllowedError" || signal().aborted || state.credentialCreated) throw error;
-    await closeWalletModule();
-    checkContext();
-    $("new-wallet-note").textContent = "No passkey was selected. Your browser cannot tell us whether you cancelled or have no passkey. Try logging in again, or explicitly create a separate wallet if you are new here.";
-    $("new-wallet-panel").hidden = false;
-    setStatus("No passkey selected. Try again, or create a new wallet.");
-    return;
-  }
+  setStatus(state.accountId ? "Approve your saved passkey to unlock your wallet. No transaction is signed."
+    : "Choose your existing passkey to unlock your wallet. No transaction is signed.");
+  const approval = await assertion(challenge, state.accountId
+    ? unhex(state.accountId, "Saved passkey credential ID", undefined, 1024) : undefined);
+  state.accountId = approval.credential_id;
+  state.hasAccount = true;
   setStatus("Looking up the selected passkey's registered public identity…");
   let identity;
   let pending = false;
@@ -848,13 +886,7 @@ async function loginPasskey() {
     if (!identity) {
       await closeWalletModule();
       checkContext();
-      if (state.credentialCreated) {
-        throw new Error("This passkey is not registered. Select the passkey just created in this tab to finish its setup.");
-      }
-      $("new-wallet-note").textContent = "This passkey is not registered with this wallet's gateway. Choose another passkey with Log in with passkey, or explicitly create a separate new wallet. No wallet has been opened.";
-      $("new-wallet-panel").hidden = false;
-      setStatus("Unregistered passkey. Choose another, or create a separate new wallet.");
-      return;
+      throw new Error("The selected passkey's public registration is unavailable. Use the original setup browser to finish registering this same passkey. No replacement passkey or wallet will be created.");
     }
     pending = true;
     state.credentialCreated = true;
@@ -1049,7 +1081,13 @@ function renderAmount() {
 
 function renderControls() {
   const locked = state.busy || !!hasPendingResult();
-  $("create-passkey").disabled = state.busy || !state.config || !!state.identity || state.credentialCreated;
+  const setup = !!state.config && state.accountStorage && !state.hasAccount && !state.credentialCreated;
+  $("setup-panel").hidden = !setup;
+  $("setup-passkey").disabled = state.busy || !setup || !!state.identity;
+  $("login-passkey").textContent = state.hasAccount ? "Unlock wallet" : "Continue with passkey";
+  $("passkey-note").textContent = state.hasAccount
+    ? "Your passkey account is remembered. Unlock the same wallet with one approval."
+    : "Use your existing passkey. First-time setup is only for someone who does not have a passkey account yet.";
   $("login-passkey").disabled = state.busy || !state.config || !!state.identity;
   $("refresh-balance").disabled = state.busy || !state.wallet;
   $("copy-address").disabled = state.busy || !state.wallet;
@@ -1134,8 +1172,8 @@ async function run(label, operation, deadline = 90000) {
   }
 }
 
-$("create-passkey").addEventListener("click", () => run("Waiting for a new passkey with user verification…", createPasskey, 240000));
-$("login-passkey").addEventListener("click", () => run("Preparing passkey login…", loginPasskey, 180000));
+$("setup-passkey").addEventListener("click", () => run("Setting up your passkey account…", () => enterAccount(setupPasskey), 240000));
+$("login-passkey").addEventListener("click", () => run("Unlocking your passkey account…", () => enterAccount(loginPasskey), 180000));
 $("refresh-balance").addEventListener("click", () => run("Refreshing wallet history…", syncWallet, 180000));
 $("payment-form").addEventListener("submit", (event) => {
   event.preventDefault();
@@ -1233,7 +1271,7 @@ $("log-out").addEventListener("click", async () => {
     state.historyLimit = 25;
     state.credentialCreated = false;
     state.requestSent = false;
-    resetNewWalletOffer();
+    $("setup-panel").open = false;
     invalidateReview();
     clearResult();
     $("passkey-panel").hidden = false;
@@ -1258,8 +1296,7 @@ $("log-out").addEventListener("click", async () => {
     $("amount-sats").value = "";
     $("fee-rate").value = "1";
     $("fee-note").textContent = "Manual starting rate: 1 sat/vB. Refresh asks the indexer for an editable suggestion.";
-    $("passkey-note").textContent = "Log in with one passkey approval. No transaction is signed. New here? Start with Log in with passkey.";
-    setStatus("Logged out. Your registered passkey, public credential metadata and saved history are kept.");
+    setStatus("Logged out. Your account is remembered; use the same passkey to unlock this wallet.");
   });
   if (!state.identity) $("login-passkey").focus();
 });
@@ -1277,5 +1314,6 @@ run("Loading the pinned static configuration…", async () => {
   requireThat(crypto.subtle && crypto.getRandomValues && typeof WebAssembly !== "undefined", "This wallet requires WebCrypto, WebAssembly, and WebAuthn.");
   requireThat(navigator.locks?.request, "This wallet requires Web Locks to prevent conflicting tabs. Use a current secure-context browser.");
   await loadConfiguration();
-  setStatus("Ready to log in.");
+  await recognizeAccount();
+  setStatus(state.hasAccount ? "Your account is remembered. Unlock your wallet with its passkey." : "Continue with your passkey, or complete first-time setup if you do not have one.");
 });

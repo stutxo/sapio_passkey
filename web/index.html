@@ -25,12 +25,13 @@
     <div id="wallet-app" aria-busy="true">
       <section id="passkey-panel" aria-labelledby="passkey-heading">
         <h1 id="passkey-heading" class="visually-hidden" tabindex="-1">Sapio passkey wallet</h1>
-        <p id="passkey-note" class="visually-hidden">Log in with one passkey approval. No transaction is signed. New here? Start with Log in with passkey.</p>
-        <button id="login-passkey" type="button" aria-describedby="passkey-note" disabled>Log in with passkey</button>
-        <div id="new-wallet-panel" hidden>
-          <p id="new-wallet-note">No passkey was selected. Try logging in again, or explicitly create a separate new wallet. Creating a new passkey does not open an existing wallet.</p>
-          <button id="create-passkey" type="button" aria-describedby="new-wallet-note" disabled>Create a new wallet</button>
-        </div>
+        <p id="passkey-note" class="visually-hidden">Use your existing passkey to unlock your wallet.</p>
+        <button id="login-passkey" type="button" aria-describedby="passkey-note" disabled>Continue with passkey</button>
+        <details id="setup-panel" hidden>
+          <summary>First time here?</summary>
+          <p id="setup-note">Set up your passkey account once. If you already have a passkey, use it above—even on a new device.</p>
+          <button id="setup-passkey" type="button" aria-describedby="setup-note" disabled>Set up passkey</button>
+        </details>
       </section>
 
       <p id="cache-warning" class="notice" role="alert" hidden></p>
@@ -167,7 +168,7 @@
       <p>Test coins only, not production custody. Keep this exact origin. Losing your original passkey or the pinned signer has no recovery path.</p>
       <p>This is an experimental test-coin wallet, not a production custody assurance. This page, its hosting and its WASM assets must be trusted to display and authorize the right payment. Authenticator attestation is not requested. Private passkey material stays with your authenticator.</p>
       <p>The gateway stores your public passkey credential ID and public key before a new wallet is ready to receive. On login, one fresh passkey approval is verified locally against that registered public key; no transaction is signed. This public registry is not a spending credential or verified authenticator attestation. Registration is immutable, and the gateway must remain available to look up your identity when logging in. Losing your original passkey still loses access.</p>
-      <p>Public credential metadata, BDK history and signed transaction bytes are cached automatically in this browser's IndexedDB, never private keys. Anyone with access to browser storage may read these details. Logging out clears this tab's active wallet and releases its tab lock, but preserves your passkey, registered public identity and saved history. Clearing browser data does not strand a registered wallet: log in with its original passkey on this exact origin. It does erase local signed bytes and pending setup metadata. If registration fails, keep the setup tab open and explicitly retry Log in with passkey using the same credential; no receive wallet is ready until registration succeeds.</p>
+      <p>This browser remembers one passkey account using public credential metadata in IndexedDB, never private keys. Returning visits and logout keep that account selected; a cancelled or failed login never creates a replacement wallet. First-time setup is unavailable once an account is known. Browsers cannot silently enumerate passkeys on another device: select your existing passkey there rather than setting up another. BDK history and signed transaction bytes are also cached locally and may be read by anyone with access to browser storage. Clearing browser data removes the remembered selection and local signed bytes, not the registered account. If registration is incomplete, keep the original setup tab open and retry with the same passkey; no receive wallet is ready until registration succeeds.</p>
       <p id="environment-badge">Signer identity not loaded</p>
       <p>Both your original passkey and the configured oracle are needed to spend. The operator must separately verify the Nitro identity, attestation and exact policy digest before pinning them. This page does not check TEE attestation and never automatically trusts a newly fetched signer identity. Local regtest software signers have no enclave assurance and their identities are ephemeral.</p>
       <p>This wallet reuses one address for receiving and change, making your activity linkable. The configured gateway (<span id="api-origin" class="mono">not loaded</span>) stores public passkey identities and sees lookup, registration and transaction requests; the chain indexer sees chain requests and transactions. Public registry records can be retrieved by credential ID. The indexer is trusted for availability, completeness, spentness and chain anchors. BDK tracks transaction history, balances and replacements; the wallet verifies funding transaction IDs and outputs, policy authorizations, signatures and exact finalization. This is not SPV or full-node validation. The indexer can omit transactions or report stale chain information, and reorganizations can change confirmations.</p>

@@ -16,7 +16,6 @@ section { margin: 24px 0; }
 .wallet-actions { flex-wrap: wrap; margin-top: 16px; }
 .header-row, .status-bar, .approval-note, .trust-notes, dt, footer { font-size: .875rem; }
 .notice, .error { border: 1px solid; padding: 12px; }
-#new-wallet-panel { margin-top: 20px; padding-left: 16px; border-left: 2px solid; }
 button, input, textarea { font: inherit; color: inherit; background: #fff; border: 1px solid; border-radius: 2px; }
 button { min-height: 44px; max-width: 100%; padding: 8px 14px; cursor: pointer; }
 button:hover:not(:disabled) { background: #000; color: #fff; }
