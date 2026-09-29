@@ -1,4 +1,4 @@
-//! Stateless public restoration and immutable passkey transaction authorization.
+//! Public passkey login and immutable passkey transaction authorization.
 use crate::{
     context::Wallet,
     contract,
@@ -17,7 +17,7 @@ use bitcoin::secp256k1::{Message, Secp256k1};
 use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
 use bitcoin::{Address, Amount, Txid};
 use miniscript::psbt::PsbtExt;
-use p256::ecdsa::{Signature, VerifyingKey};
+use p256::ecdsa::{signature::hazmat::PrehashVerifier, Signature, VerifyingKey};
 use sapio_base::program::{EvaluatorId, ProgramInstance, ProgramSpendPath};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -46,20 +46,22 @@ struct SignInput {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RestoreNonce {
+struct LoginNonce {
     nonce: String,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RestoreInput {
+struct LoginInput {
     nonce: String,
-    assertions: [RestoreAssertion; 2],
+    public_key: String,
+    credential_id: String,
+    assertion: LoginAssertion,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RestoreAssertion {
+struct LoginAssertion {
     credential_id: String,
     authenticator_data: String,
     client_data_json: String,
@@ -69,7 +71,7 @@ struct RestoreAssertion {
 // Match the guest's extensible clientDataJSON parsing without reserializing the
 // signed bytes. Derive rejects duplicate recognized fields, even escaped names.
 #[derive(Deserialize)]
-struct RestoreClientData {
+struct LoginClientData {
     #[serde(rename = "type")]
     ceremony: String,
     challenge: String,
@@ -326,7 +328,7 @@ fn nonce(encoded: &str) -> Result<[u8; 32]> {
         .map_err(|_| anyhow!("nonce must be 32 bytes"))
 }
 
-fn restoration_challenges(app: &Wallet<'_>, nonce: &[u8; 32]) -> [[u8; 32]; 2] {
+fn login_challenge(app: &Wallet<'_>, nonce: &[u8; 32]) -> [u8; 32] {
     let module = contract::hash(contract::WASM);
     let genesis = bitcoin::blockdata::constants::genesis_block(app.network)
         .block_hash()
@@ -334,26 +336,23 @@ fn restoration_challenges(app: &Wallet<'_>, nonce: &[u8; 32]) -> [[u8; 32]; 2] {
     let root = app.root.encode();
     let rp_id = contract::hash(app.rp_id.as_bytes());
     let origin = contract::hash(app.origin.as_bytes());
-    let mut base = sha256::Hash::engine();
-    base.input(b"sapio-passkey/restore/v1\0");
-    base.input(nonce);
-    [0, 1].map(|index| {
-        let mut engine = base.clone();
-        engine.input(&[index]);
-        engine.input(&module);
-        engine.input(&genesis);
-        engine.input(&root);
-        engine.input(&rp_id);
-        engine.input(&origin);
-        sha256::Hash::from_engine(engine).to_byte_array()
-    })
+    let mut engine = sha256::Hash::engine();
+    engine.input(b"sapio-passkey/login/v1\0");
+    engine.input(nonce);
+    engine.input(&module);
+    engine.input(&genesis);
+    engine.input(&root);
+    engine.input(&rp_id);
+    engine.input(&origin);
+    sha256::Hash::from_engine(engine).to_byte_array()
 }
 
-fn restoration_candidates(
+fn verify_login_assertion(
     app: &Wallet<'_>,
-    assertion: &RestoreAssertion,
+    assertion: &LoginAssertion,
     challenge: &[u8; 32],
-) -> Result<[Option<[u8; 33]>; 4]> {
+    public_key: &VerifyingKey,
+) -> Result<()> {
     let auth = decode_hex(&assertion.authenticator_data, 37, "authenticator data")?;
     let client = decode_hex(
         &assertion.client_data_json,
@@ -366,14 +365,14 @@ fn restoration_candidates(
     ensure!((8..=72).contains(&der.len()), "invalid ES256 DER length");
     ensure!(
         auth[..32] == contract::hash(app.rp_id.as_bytes()),
-        "restoration RP ID mismatch"
+        "login RP ID mismatch"
     );
     let flags = auth[32];
     ensure!(
         flags & 0x05 == 0x05 && flags & !0x1d == 0 && (flags & 0x10 == 0 || flags & 0x08 != 0),
         "invalid authenticator flags"
     );
-    let parsed: RestoreClientData =
+    let parsed: LoginClientData =
         serde_json::from_slice(&client).map_err(|_| anyhow!("invalid clientDataJSON"))?;
     let mut expected = [0; 43];
     URL_SAFE_NO_PAD
@@ -385,7 +384,7 @@ fn restoration_candidates(
             && parsed.origin == app.origin
             && !parsed.cross_origin
             && !parsed.top_origin,
-        "restoration client data mismatch"
+        "login client data mismatch"
     );
     // Original signed JSON is authoritative; parsing is only for context checks.
     let mut signed = [0; 69];
@@ -394,48 +393,31 @@ fn restoration_candidates(
     let digest = contract::hash(&signed);
     // Strict DER/scalar parsing deliberately preserves valid high-S signatures.
     let signature = Signature::from_der(&der).map_err(|_| anyhow!("invalid ES256 signature"))?;
-    let mut candidates = [None; 4];
-    for id in 0u8..4 {
-        // RustCrypto RecoveryId has exactly the two-bit values 0..=3. Recovery
-        // also verifies each candidate against this digest and signature.
-        if let Ok(key) = VerifyingKey::recover_from_prehash(
-            &digest,
-            &signature,
-            id.try_into().expect("valid two-bit RecoveryId"),
-        ) {
-            let mut compressed = [0; 33];
-            compressed.copy_from_slice(key.to_encoded_point(true).as_bytes());
-            candidates[usize::from(id)] = Some(compressed);
-        }
-    }
-    Ok(candidates)
+    public_key
+        .verify_prehash(&digest, &signature)
+        .map_err(|_| anyhow!("invalid login signature"))
 }
 
-fn restore(app: &Wallet<'_>, input: RestoreInput) -> Result<Value> {
-    let challenges = restoration_challenges(app, &nonce(&input.nonce)?);
-    let first_id = decode_hex(&input.assertions[0].credential_id, 1024, "credential ID")?;
-    let second_id = decode_hex(&input.assertions[1].credential_id, 1024, "credential ID")?;
+fn login(app: &Wallet<'_>, input: LoginInput) -> Result<Value> {
+    let challenge = login_challenge(app, &nonce(&input.nonce)?);
+    let credential_id = decode_hex(&input.credential_id, 1024, "credential ID")?;
+    let assertion_id = decode_hex(&input.assertion.credential_id, 1024, "credential ID")?;
     ensure!(
-        !first_id.is_empty() && first_id == second_id,
-        "restoration requires the same nonempty credential ID"
+        !credential_id.is_empty() && credential_id == assertion_id,
+        "login credential ID mismatch"
     );
-    let first = restoration_candidates(app, &input.assertions[0], &challenges[0])?;
-    let second = restoration_candidates(app, &input.assertions[1], &challenges[1])?;
-    let mut common = None;
-    for key in first.into_iter().flatten() {
-        if second.contains(&Some(key)) {
-            ensure!(
-                common.is_none() || common == Some(key),
-                "ambiguous restoration public key"
-            );
-            common = Some(key);
-        }
-    }
-    let public_key = common.context("restoration assertions have no common public key")?;
-    // Public-data reconstruction only: no authorization state or signing path.
+    let public_key = decode_hex(&input.public_key, 33, "public key")?;
+    ensure!(
+        public_key.len() == 33 && matches!(public_key[0], 2 | 3),
+        "login requires a compressed P-256 public key"
+    );
+    let verifier = VerifyingKey::from_sec1_bytes(&public_key)
+        .map_err(|_| anyhow!("invalid P-256 public key"))?;
+    verify_login_assertion(app, &input.assertion, &challenge, &verifier)?;
+    // This public identity proof grants no transaction authorization or session token.
     Ok(json!({
         "public_key": hex::encode(public_key),
-        "credential_id": hex::encode(first_id),
+        "credential_id": hex::encode(credential_id),
     }))
 }
 
@@ -465,13 +447,13 @@ pub(crate) fn dispatch(app: &Wallet<'_>, operation: &str, body: Value) -> Result
                 "internal_key": key.to_string(),
             }))
         }
-        "restore_challenges" => {
-            let input: RestoreNonce = parse_body(body)?;
+        "login_challenge" => {
+            let input: LoginNonce = parse_body(body)?;
             Ok(json!({
-                "challenges": restoration_challenges(app, &nonce(&input.nonce)?).map(hex::encode),
+                "challenge": hex::encode(login_challenge(app, &nonce(&input.nonce)?)),
             }))
         }
-        "restore" => restore(app, parse_body(body)?),
+        "login" => login(app, parse_body(body)?),
         "request" => request(app, parse_body(body)?),
         "finalize_passkey" => finalize_passkey(app, parse_body(body)?),
         _ => anyhow::bail!("unknown wallet operation"),

@@ -1,4 +1,5 @@
 import { walletCall, syncWallet as syncSession, closeWalletModule } from "./wallet.js";
+import { renderReceiveQr } from "./qr.js";
 
 "use strict";
 
@@ -15,11 +16,20 @@ const state = {
   identity: null, wallet: null, snapshot: null, syncReady: false, review: null, result: null,
   resultStatus: null, controller: null, busy: false, phase: null,
   requestSent: false, credentialCreated: false, feeEdited: false, sendMax: false,
-  bumpTxid: null, historyLimit: 25, releaseLock: null, cacheKey: null,
+  bumpTxid: null, historyLimit: 25, releaseLock: null, cacheKey: null, credentials: new Map(),
 };
 
 function requireThat(condition, message) {
   if (!condition) throw new Error(message);
+}
+
+class RegistryError extends Error {
+  constructor(status, operation) {
+    super(status === 409
+      ? "This credential is already registered with a different public key. No wallet was opened."
+      : `Public passkey ${operation} failed (HTTP ${status}).`);
+    this.status = status;
+  }
 }
 
 function object(value, label) {
@@ -202,7 +212,6 @@ async function loadConfiguration() {
   state.signUrl = `${api.origin}/api/sign`;
   state.chainUrl = `${api.origin}/esplora`;
   state.chain = config.chain;
-  $("wallet-title").textContent = config.chain === "mutinynet" ? "Mutinynet wallet" : "Regtest wallet";
   $("network-badge").textContent = config.chain === "mutinynet" ? "Mutinynet · signet test coins" : "Regtest · local fixture only";
   $("environment-badge").textContent = validated.local_dev
     ? "Local software signer · not a hardware enclave"
@@ -218,6 +227,56 @@ function validateIdentity(value) {
   const key = unhex(identity.public_key, "Passkey public key", 33);
   requireThat(key[0] === 2 || key[0] === 3, "Passkey public key is not compressed P-256.");
   return freeze(identity);
+}
+
+async function registryIdentity(credentialId, identity) {
+  unhex(credentialId, "Passkey credential ID", undefined, 1024);
+  const registering = identity !== undefined;
+  const path = registering ? "/api/passkeys" : `/api/passkeys/${credentialId}`;
+  const operation = registering ? "registration" : "lookup";
+  const registered = await fetchResponse(`${state.apiUrl}${path}`, `Passkey ${operation}`,
+    { ...(registering ? jsonBody(identity) : {}), headers: {
+      Accept: "application/json", ...(registering ? { "Content-Type": "application/json" } : {}),
+    } }, async (response, requestSignal) => {
+      if (!response.ok) throw new RegistryError(response.status, operation);
+      requireThat(response.status === 200 || (registering && response.status === 201),
+        `Unexpected passkey ${operation} response (HTTP ${response.status}).`);
+      return validateIdentity(await readJson(response, `Passkey ${operation}`, requestSignal));
+    });
+  requireThat(registered.credential_id === credentialId
+    && (!registering || registered.public_key === identity.public_key),
+  "The public registry returned a different passkey identity.");
+  return registered;
+}
+
+async function saveCredential(identity, pendingRegistration) {
+  const record = freeze({ identity, pending_registration: pendingRegistration });
+  // Keep the native create() public key even if browser storage or enrollment fails.
+  state.credentials.set(identity.credential_id, record);
+  try {
+    await cacheOperation("write", record, identity.credential_id);
+  } catch (error) {
+    cacheWarning(`Could not save public credential metadata: ${explainError(error)} This tab retains it. Registered wallets can still log in through the gateway. If setup is incomplete, keep this tab open and retry Log in with passkey.`);
+  }
+}
+
+async function pendingCredential(credentialId) {
+  let record = state.credentials.get(credentialId);
+  if (record === undefined) {
+    try {
+      record = await cacheOperation("read", undefined, credentialId);
+    } catch (error) {
+      throw new Error(`The passkey is not registered and its pending setup metadata could not be read: ${explainError(error)} Retry login in the original setup tab; no wallet has been opened.`);
+    }
+  }
+  if (record === undefined) return null;
+  object(record, "Saved public credential");
+  requireThat(Object.keys(record).length === 2 && typeof record.pending_registration === "boolean",
+    "Saved public credential metadata is invalid.");
+  const identity = validateIdentity(record.identity);
+  requireThat(identity.credential_id === credentialId, "Saved public credential ID does not match the selected passkey.");
+  state.credentials.set(credentialId, freeze(record));
+  return record.pending_registration ? identity : null;
 }
 
 async function deriveWallet(publicKey) {
@@ -252,16 +311,19 @@ async function acceptWallet(identity, opened, note) {
   state.syncReady = false;
   state.historyLimit = 25;
   applySnapshot(opened.snapshot);
+  renderReceiveQr($("receive-qr"), wallet.address);
   state.credentialCreated = false;
   resetNewWalletOffer();
   state.identity = identity;
   $("passkey-note").textContent = note;
   $("receive-address").value = wallet.address;
+  $("receive-address-short").textContent = `${wallet.address.slice(0, 12)}…${wallet.address.slice(-8)}`;
+  $("receive-address-details").open = false;
   $("passkey-panel").hidden = true;
   for (const id of ["wallet-panel", "payment-panel", "history-panel"]) $(id).hidden = false;
   $("balance-heading").focus();
-  // Restoration above never consults storage. Only the reconstructed wallet
-  // may import its context-bound public cache.
+  // A registered identity has been established before reading its
+  // context-bound public history cache.
   try {
     const cached = await cacheOperation("read");
     checkContext();
@@ -296,9 +358,13 @@ function cacheWarning(message) {
   $("cache-warning").hidden = false;
 }
 
-function cacheOperation(action, value) {
-  requireThat(state.releaseLock && state.cacheKey, "Public history storage requires this wallet's exclusive tab lock.");
-  const key = state.cacheKey;
+function cacheOperation(action, value, credentialId) {
+  const credential = credentialId !== undefined;
+  requireThat(credential ? state.config && state.apiUrl : state.releaseLock && state.cacheKey,
+    "Public storage requires a pinned context, and wallet history requires its exclusive tab lock.");
+  const storeName = credential ? "credentials" : "wallets";
+  const key = credential ? JSON.stringify([ORIGIN, RP_ID, state.apiUrl, state.config.network,
+    state.config.genesis_hash, state.config.xpub, state.config.module_sha256, credentialId]) : state.cacheKey;
   return new Promise((resolve, reject) => {
     let db;
     let transaction;
@@ -316,37 +382,42 @@ function cacheOperation(action, value) {
       finish(new Error("Browser storage did not respond in time."));
     }, 5000);
     let opening;
-    try { opening = indexedDB.open("sapio-passkey-public-history", 1); }
+    try { opening = indexedDB.open("sapio-passkey-public-history", 2); }
     catch (error) { finish(error); return; }
     opening.onupgradeneeded = () => {
-      if (!opening.result.objectStoreNames.contains("wallets")) opening.result.createObjectStore("wallets");
+      // Clean cutover: old history had no registered credential identity.
+      if (opening.result.objectStoreNames.contains("wallets")) opening.result.deleteObjectStore("wallets");
+      opening.result.createObjectStore("wallets");
+      opening.result.createObjectStore("credentials");
     };
-    opening.onerror = () => finish(opening.error || new Error("Public history storage could not be opened."));
-    opening.onblocked = () => finish(new Error("Another tab is blocking public history storage."));
+    opening.onerror = () => finish(opening.error || new Error("Public browser storage could not be opened."));
+    opening.onblocked = () => finish(new Error("Another tab is blocking public browser storage."));
     opening.onsuccess = () => {
       db = opening.result;
       if (settled) { db.close(); return; }
       db.onversionchange = () => db.close();
       try {
-        transaction = db.transaction("wallets", action === "read" ? "readonly" : "readwrite");
-        const store = transaction.objectStore("wallets");
+        transaction = db.transaction(storeName, action === "read" ? "readonly" : "readwrite");
+        const store = transaction.objectStore(storeName);
         const request = action === "read" ? store.get(key) : store.put(value, key);
         transaction.oncomplete = () => finish(null, request.result);
-        transaction.onabort = () => finish(transaction.error || new Error("Public history storage was interrupted."));
-        transaction.onerror = () => finish(transaction.error || new Error("Public history storage failed."));
+        transaction.onabort = () => finish(transaction.error || new Error("Public browser storage was interrupted."));
+        transaction.onerror = () => finish(transaction.error || new Error("Public browser storage failed."));
       } catch (error) { finish(error); }
     };
   });
 }
 
 async function savePublicState() {
-  if (!state.wallet) return;
+  if (!state.wallet) return false;
   try {
     // Storage failure never drops signed bytes or the in-memory BDK session.
     const publicState = await walletCall("export_state", state.context);
     await cacheOperation("write", publicState);
+    return true;
   } catch (error) {
     cacheWarning(`Could not save public history: ${explainError(error)} This open wallet and any signed transaction remain in memory. Keep the tab open if you need its retry bytes.`);
+    return false;
   }
 }
 
@@ -387,6 +458,7 @@ function applySnapshot(value) {
   state.snapshot = freeze(snapshot);
   for (const [id, key] of [["balance-confirmed", "confirmed_sats"], ["balance-pending", "pending_sats"],
     ["balance-immature", "immature_sats"], ["balance-spendable", "spendable_sats"]]) $(id).textContent = formatSats(snapshot.balance[key]);
+  renderAmount();
   renderHistory();
   renderResult();
 }
@@ -625,7 +697,7 @@ function renderReview(proposal) {
   const summary = proposal.summary;
   for (const [id, value] of Object.entries({
     "review-recipient": summary.recipient, "review-amount": formatSats(summary.amount_sats),
-    "review-fee": `${formatSats(summary.fee_sats)} · requested ${summary.fee_rate_sat_vb} sat/vB`,
+    "review-fee": formatSats(summary.fee_sats),
     "review-size": `${summary.vsize} vB`, "review-total": formatSats(summary.amount_sats + summary.fee_sats),
     "review-change": formatSats(summary.change_sats),
     "review-change-address": summary.change_sats > 0 ? summary.change_address : "No change output",
@@ -641,8 +713,10 @@ function renderReview(proposal) {
   }));
   $("review-details").hidden = false;
   $("review").hidden = false;
-  $("send-payment").textContent = `Approve & sign · ${summary.input_count} ${summary.input_count === 1 ? "approval" : "approvals"}`;
-  setStatus("Review the exact transaction. Approve & sign requests fresh passkey approvals; broadcast is a separate explicit action.");
+  $("review-technical").open = false;
+  $("review-max-note").hidden = !state.sendMax || !!summary.replaces;
+  $("send-payment").textContent = "Confirm & send";
+  setStatus("Check the recipient, amount and fee. Confirm & send requests fresh passkey approvals and submits this exact transaction.");
   $("review-heading").focus();
 }
 
@@ -672,6 +746,10 @@ async function createPasskey() {
   checkContext();
   requireThat(!state.identity, "Log out before creating another passkey.");
   requireThat(!state.credentialCreated && !$("new-wallet-panel").hidden, "Log in with your passkey before choosing to create a new wallet.");
+  if (!window.confirm("Create a separate new wallet and passkey? This will not open an existing wallet. Its public credential ID and public key will be registered with the gateway.")) {
+    setStatus("New wallet creation cancelled. Log in with an existing passkey instead.");
+    return;
+  }
   resetNewWalletOffer();
   requireThat(typeof PublicKeyCredential !== "undefined" && navigator.credentials?.create, "This browser does not support passkey creation.");
   state.phase = "opening";
@@ -686,9 +764,8 @@ async function createPasskey() {
   }, signal: signal() });
   state.credentialCreated = true;
   const id = credentialBytes(credential);
-  checkContext();
   requireThat(credential.getClientExtensionResults().credProps?.rk !== false,
-    "The authenticator did not create a discoverable passkey. This credential cannot be opened without saved metadata.");
+    "The authenticator did not create the required discoverable passkey. No receive wallet has been opened.");
   const response = credential.response;
   requireThat(typeof response.getPublicKey === "function" && typeof response.getPublicKeyAlgorithm === "function"
     && typeof response.getAuthenticatorData === "function", "Use a current browser that exposes WebAuthn ES256 public keys.");
@@ -702,9 +779,14 @@ async function createPasskey() {
   requireThat(point.length === 65 && point[0] === 4, "Unexpected ES256 public-key encoding.");
   const publicKey = hex(concat(Uint8Array.of(2 | (point[64] & 1)), point.subarray(1, 33)));
   const identity = validateIdentity({ public_key: publicKey, credential_id: hex(id) });
-  setStatus("Passkey created. Deriving your receive address locally…");
+  await saveCredential(identity, true);
+  checkContext();
+  setStatus("Passkey created. Registering its public identity before opening your wallet…");
+  await registryIdentity(identity.credential_id, identity);
+  await saveCredential(identity, false);
+  checkContext();
   const wallet = await deriveWallet(publicKey);
-  await acceptWallet(identity, wallet, "Use this passkey on this exact origin to log in again.");
+  await acceptWallet(identity, wallet, "Your public identity is registered. Use this passkey on this exact origin to log in again.");
   state.phase = "sync";
   await syncWallet();
 }
@@ -730,38 +812,66 @@ async function assertion(challenge, expectedId) {
   return { credential_id: hex(id), authenticator_data: hex(auth), client_data_json: hex(json), signature: hex(signature) };
 }
 
-async function restorePasskey() {
+async function loginPasskey() {
   checkContext();
   requireThat(!state.identity, "Log out before opening another wallet.");
   resetNewWalletOffer();
-  state.phase = "restoring";
+  state.phase = "login";
   const nonce = hex(crypto.getRandomValues(new Uint8Array(32)));
-  const result = object(await walletCall("restore_challenges", state.context, { nonce }, signal()), "Restoration challenges");
-  requireThat(Object.keys(result).length === 1 && Array.isArray(result.challenges)
-    && result.challenges.length === 2, "The wallet must return exactly two restoration challenges.");
-  const challenges = result.challenges.map((value) => unhex(value, "Restoration challenge", 32));
-  requireThat(!equal(challenges[0], challenges[1]), "Restoration requires two different challenges.");
-  setStatus("Log in · 1 of 2: choose your passkey. No transaction is signed.");
-  let first;
+  const result = object(await walletCall("login_challenge", state.context, { nonce }, signal()), "Login challenge");
+  requireThat(Object.keys(result).length === 1 && Object.hasOwn(result, "challenge"),
+    "The wallet returned an invalid login challenge.");
+  const challenge = unhex(result.challenge, "Login challenge", 32);
+  setStatus("Choose and approve your passkey to log in. No transaction is signed.");
+  let approval;
   try {
-    first = await assertion(challenges[0]);
+    approval = await assertion(challenge);
   } catch (error) {
     if (error?.name !== "NotAllowedError" || signal().aborted || state.credentialCreated) throw error;
     await closeWalletModule();
     checkContext();
-    $("new-wallet-note").textContent = "No passkey was selected. Your browser cannot tell us whether you cancelled or have no passkey. Try logging in again, or create a new wallet if you are new here. A new passkey opens a different wallet.";
+    $("new-wallet-note").textContent = "No passkey was selected. Your browser cannot tell us whether you cancelled or have no passkey. Try logging in again, or explicitly create a separate wallet if you are new here.";
     $("new-wallet-panel").hidden = false;
     setStatus("No passkey selected. Try again, or create a new wallet.");
     return;
   }
-  const id = unhex(first.credential_id, "Passkey credential ID", undefined, 1024);
-  setStatus("Log in · 2 of 2: approve the same passkey again. No transaction is signed.");
-  const second = await assertion(challenges[1], id);
-  setStatus("Opening your wallet…");
-  const identity = validateIdentity(await walletCall("restore", state.context, { nonce, assertions: [first, second] }, signal()));
-  requireThat(identity.credential_id === first.credential_id, "The restored identity does not match the selected passkey.");
-  const wallet = await deriveWallet(identity.public_key);
-  await acceptWallet(identity, wallet, "Logged in with two approvals. No transaction was signed.");
+  setStatus("Looking up the selected passkey's registered public identity…");
+  let identity;
+  let pending = false;
+  try {
+    identity = await registryIdentity(approval.credential_id);
+  } catch (error) {
+    if (!(error instanceof RegistryError) || error.status !== 404) throw error;
+    checkContext();
+    identity = await pendingCredential(approval.credential_id);
+    checkContext();
+    if (!identity) {
+      await closeWalletModule();
+      checkContext();
+      if (state.credentialCreated) {
+        throw new Error("This passkey is not registered. Select the passkey just created in this tab to finish its setup.");
+      }
+      $("new-wallet-note").textContent = "This passkey is not registered with this wallet's gateway. Choose another passkey with Log in with passkey, or explicitly create a separate new wallet. No wallet has been opened.";
+      $("new-wallet-panel").hidden = false;
+      setStatus("Unregistered passkey. Choose another, or create a separate new wallet.");
+      return;
+    }
+    pending = true;
+    state.credentialCreated = true;
+  }
+  setStatus("Verifying your login locally…");
+  const verified = validateIdentity(await walletCall("login", state.context,
+    { nonce, ...identity, assertion: approval }, signal()));
+  requireThat(verified.credential_id === approval.credential_id
+    && verified.public_key === identity.public_key, "The verified login does not match the selected registered passkey.");
+  if (pending) {
+    setStatus("Login verified. Retrying public registration for this same passkey…");
+    await registryIdentity(verified.credential_id, verified);
+  }
+  await saveCredential(verified, false);
+  checkContext();
+  const wallet = await deriveWallet(verified.public_key);
+  await acceptWallet(verified, wallet, "Logged in with one passkey approval. No transaction was signed.");
   state.phase = "sync";
   await syncWallet();
 }
@@ -805,7 +915,7 @@ async function sendPayment() {
   const responses = [];
   let firstRequest;
   for (let inputIndex = 0; inputIndex < proposal.summary.input_count; inputIndex++) {
-    setStatus(`Approve & sign · passkey approval ${inputIndex + 1}/${proposal.summary.input_count} for the reviewed transaction…`);
+    setStatus(`Confirm & send · passkey approval ${inputIndex + 1}/${proposal.summary.input_count}…`);
     const proof = await assertion(unhex(proposal.challenges[inputIndex], "Passkey challenge", 32), credentialId);
     const request = await walletCall("request", state.context, {
       public_key: identity.public_key, psbt: proposal.psbt, nonce: proposal.nonce, input_index: inputIndex,
@@ -831,9 +941,8 @@ async function sendPayment() {
   renderResult();
   invalidateReview();
   applySnapshot(await walletCall("snapshot", state.context));
-  await savePublicState();
-  setStatus("Transaction signed and reserved locally. Inspect its bytes, then explicitly choose Broadcast signed transaction.");
-  $("result-heading").focus();
+  requireThat(await savePublicState(), "The signed transaction could not be saved before sending. It remains below; save its bytes before explicitly sending it.");
+  setStatus("Transaction signed and saved. Sending the exact reviewed bytes…");
 }
 
 async function broadcastTransaction() {
@@ -893,12 +1002,12 @@ function renderResult() {
   $("signed-psbt-field").hidden = !state.result.signed_psbt;
   const status = resultState();
   const messages = {
-    ready: ["Signed · awaiting broadcast", "WASM verified every signature and finalized this exact transaction. This tab has not submitted it yet. You can explicitly broadcast these same bytes."],
-    broadcasting: ["Broadcast in progress", "The exact signed transaction is being submitted. Cancelling stops this tab’s wait, not a transaction already received by the indexer."],
-    uncertain: ["Broadcast outcome uncertain", "This transaction may already have been submitted, including before a reload, rejection, timeout or cancellation. Check its ID; retry submits only the same signed bytes, without signing again."],
-    submitted: ["Submitted · confirmation not observed", "The endpoint returned the exact transaction ID verified locally by WASM. A returned ID is not proof of mempool acceptance or confirmation. Refresh history or inspect the explorer for indexer-reported evidence."],
-    confirmed: ["Confirmed · indexer-reported", "BDK reports a block anchor for this transaction in the indexer's chain view. The history below shows its confirmation count. This is not SPV verification and a reorganization can change its status."],
-    replaced: ["Replaced / conflicted · wallet view", "The wallet knows a conflicting or replacement transaction. Unconfirmed conflicts can change. These signed bytes are retained for inspection, but this page will not rebroadcast them. See history for the conflicting transaction ID."],
+    ready: ["Signed · not sent", "This tab has not sent these signed bytes. Keep them or explicitly send this same transaction."],
+    broadcasting: ["Sending…", "Submitting the exact signed transaction. Cancellation cannot recall a transaction already received by the network."],
+    uncertain: ["Send outcome unknown", "This transaction may already be on the network. Check its ID; retry sends only the same signed bytes, without signing again."],
+    submitted: ["Sent · awaiting confirmation", "The endpoint returned the verified transaction ID, not proof of acceptance or confirmation. Check history or the explorer."],
+    confirmed: ["Confirmed · indexer-reported", "The indexer reports a block confirmation. This is not full-node verification; reorganizations can change it."],
+    replaced: ["Replaced / conflicted", "A conflicting transaction is known. These signed bytes remain available, but will not be resent."],
   };
   const [heading, note] = messages[status];
   $("result-heading").textContent = heading;
@@ -906,7 +1015,7 @@ function renderResult() {
   $("broadcast-warning").hidden = ["confirmed", "replaced"].includes(status);
   $("result").classList.toggle("uncertain", status === "uncertain");
   $("retry-broadcast").hidden = !["ready", "uncertain", "submitted"].includes(status);
-  $("retry-broadcast").textContent = status === "ready" ? "Broadcast signed transaction" : "Retry broadcast · same transaction";
+  $("retry-broadcast").textContent = status === "ready" ? "Send signed transaction" : "Retry · same transaction";
   $("discard-result").hidden = status === "broadcasting";
   $("explorer-link").hidden = state.chain !== "mutinynet";
   if (state.chain === "mutinynet") $("explorer-link").href = `https://mutinynet.com/tx/${state.result.txid}`;
@@ -925,21 +1034,28 @@ function invalidateReview() {
   state.review = null;
   $("review-details").hidden = true;
   $("review").hidden = true;
-  $("send-payment").textContent = "Approve & sign";
+  $("send-payment").textContent = "Confirm & send";
+}
+
+function renderAmount() {
+  $("amount-sats").readOnly = state.sendMax;
+  $("amount-sats").required = !state.sendMax;
+  $("send-max").checked = state.sendMax;
+  if (state.sendMax) $("amount-sats").value = state.snapshot ? String(state.snapshot.balance.spendable_sats) : "";
+  $("amount-note").textContent = state.sendMax
+    ? "Max shows your full available confirmed balance after reservations. The network fee is deducted from this amount in the payment review. BDK's 16-input limit still applies."
+    : "Whole satoshis. The network fee is added to this amount. Max uses the available balance and deducts the fee in the payment review.";
 }
 
 function renderControls() {
   const locked = state.busy || !!hasPendingResult();
-  $("create-passkey").disabled = state.busy || !state.config || !!state.identity;
+  $("create-passkey").disabled = state.busy || !state.config || !!state.identity || state.credentialCreated;
   $("login-passkey").disabled = state.busy || !state.config || !!state.identity;
   $("refresh-balance").disabled = state.busy || !state.wallet;
   $("copy-address").disabled = state.busy || !state.wallet;
   for (const id of ["recipient", "fee-rate", "send-max", "bump-fee-rate"]) $(id).disabled = locked || !state.wallet;
-  $("amount-sats").disabled = locked || !state.wallet || state.sendMax;
-  $("amount-sats").required = !state.sendMax;
-  $("send-max").setAttribute("aria-pressed", String(state.sendMax));
-  $("send-max").textContent = state.sendMax ? "Use specific amount" : "Send max";
-  $("amount-note").textContent = state.sendMax ? "Send all eligible confirmed funds minus the exact reviewed fee. BDK's 16-input limit still applies." : "Whole satoshis. The network fee is added to this amount.";
+  $("amount-sats").disabled = locked || !state.wallet;
+  renderAmount();
   $("review-payment").disabled = locked || !state.syncReady;
   $("review-bump").disabled = locked || !state.syncReady || !state.bumpTxid;
   $("cancel-bump").disabled = state.busy;
@@ -955,6 +1071,7 @@ function renderControls() {
   });
   $("cancel-operation").hidden = !state.busy;
   $("cancel-operation").disabled = state.controller?.signal.aborted ?? false;
+  $("operation-status").classList.toggle("visually-hidden", !state.busy);
   $("wallet-app").setAttribute("aria-busy", String(state.busy));
 }
 
@@ -986,17 +1103,17 @@ async function run(label, operation, deadline = 90000) {
     if (state.resultStatus === "uncertain") {
       message += " Broadcast outcome is uncertain: this transaction may already be on the network. Its verified bytes and transaction ID are retained below. Retry broadcast only resubmits this same transaction; nothing is retried automatically.";
     } else if (state.resultStatus === "ready") {
-      message += " The signed transaction is retained below and has not been submitted by this tab. Use Broadcast signed transaction to submit those exact bytes.";
+      message += " The signed transaction is retained below and has not been submitted by this tab. Send signed transaction submits only those exact bytes.";
     } else if (state.phase === "signing") {
       message += state.requestSent
         ? " A signer request may have completed, but this tab did not broadcast. Partial responses are discarded; retrying starts all approvals with a fresh nonce. No request is retried automatically."
         : " This tab did not broadcast. A new signing attempt requires fresh passkey approvals.";
-    } else if (state.phase === "restoring" && !state.identity) {
-      message += " No wallet was opened and no transaction was signed. Log in again to retry both approvals.";
+    } else if (state.phase === "login" && !state.identity) {
+      message += " No wallet was opened and no transaction was signed. Log in again for a fresh approval.";
     } else if (state.phase === "sync" || (state.wallet && operation === syncWallet)) {
       message += " Your wallet and receive address remain open. No payment was initiated by this refresh.";
     }
-    if (state.credentialCreated && !state.identity) message += " A passkey may remain in your authenticator. Log in with that passkey to finish opening your wallet; do not create another.";
+    if (state.credentialCreated && !state.identity) message += " A passkey was created, but setup is not complete. Keep this tab open and explicitly log in with that same passkey to retry; do not create another. No receive wallet is ready until public registration succeeds.";
     if (!state.config) message += " Reload this page to load its configuration again.";
     if (!state.identity) {
       await closeWalletModule();
@@ -1018,14 +1135,17 @@ async function run(label, operation, deadline = 90000) {
 }
 
 $("create-passkey").addEventListener("click", () => run("Waiting for a new passkey with user verification…", createPasskey, 240000));
-$("login-passkey").addEventListener("click", () => run("Preparing passkey login…", restorePasskey, 330000));
+$("login-passkey").addEventListener("click", () => run("Preparing passkey login…", loginPasskey, 180000));
 $("refresh-balance").addEventListener("click", () => run("Refreshing wallet history…", syncWallet, 180000));
 $("payment-form").addEventListener("submit", (event) => {
   event.preventDefault();
   run("Preparing a payment locally from verified funding…", reviewPayment);
 });
-$("send-payment").addEventListener("click", () => run("Rechecking the reviewed payment before approval…", sendPayment,
-  180000 + (state.review?.proposal.summary.input_count ?? 1) * 90000));
+$("send-payment").addEventListener("click", () => run("Confirming the reviewed payment…", async () => {
+  await sendPayment();
+  checkContext();
+  await broadcastTransaction();
+}, 420000 + (state.review?.proposal.summary.input_count ?? 1) * 90000));
 $("retry-broadcast").addEventListener("click", () => run("Retrying only the same finalized transaction…", broadcastTransaction, 240000));
 for (const id of ["recipient", "amount-sats", "fee-rate", "bump-fee-rate"]) $(id).addEventListener("input", () => {
   if (state.busy || hasPendingResult()) return;
@@ -1034,9 +1154,9 @@ for (const id of ["recipient", "amount-sats", "fee-rate", "bump-fee-rate"]) $(id
   setStatus("Payment edited. Review again before approving and signing.");
   renderControls();
 });
-$("send-max").addEventListener("click", () => {
+$("send-max").addEventListener("change", () => {
   if (state.busy || hasPendingResult()) return;
-  state.sendMax = !state.sendMax;
+  state.sendMax = $("send-max").checked;
   invalidateReview();
   renderControls();
   setStatus(state.sendMax ? "Send max selected. Review to see the exact recipient amount after fees." : "Enter a specific whole-satoshi amount.");
@@ -1070,6 +1190,7 @@ $("copy-address").addEventListener("click", () => run("Copying your receive addr
     setStatus("Receive address copied. Check the pasted address before sending test coins.");
   } catch (error) {
     if (signal().aborted) throw error;
+    $("receive-address-details").open = true;
     $("receive-address").focus();
     $("receive-address").select();
     setStatus("Clipboard unavailable. The address is selected; copy it using your browser’s Copy action.");
@@ -1117,6 +1238,7 @@ $("log-out").addEventListener("click", async () => {
     clearResult();
     $("passkey-panel").hidden = false;
     for (const id of ["wallet-panel", "payment-panel", "bump-panel", "history-panel"]) $(id).hidden = true;
+    for (const id of ["balance-details", "fee-settings", "history-panel", "review-technical"]) $(id).open = false;
     renderHistory();
     for (const id of ["cache-warning", "error"]) {
       $(id).textContent = "";
@@ -1129,18 +1251,21 @@ $("log-out").addEventListener("click", async () => {
     $("review-funding").replaceChildren();
     $("bump-fee-rate").value = "1";
     $("receive-address").value = "";
+    $("receive-address-short").textContent = "";
+    $("receive-address-details").open = false;
+    $("receive-qr").replaceChildren();
     $("recipient").value = "";
     $("amount-sats").value = "";
     $("fee-rate").value = "1";
     $("fee-note").textContent = "Manual starting rate: 1 sat/vB. Refresh asks the indexer for an editable suggestion.";
-    $("passkey-note").textContent = "Use your passkey to log in. New here? Start with Log in with passkey.";
-    setStatus("Logged out. Your passkey and saved history are kept.");
+    $("passkey-note").textContent = "Log in with one passkey approval. No transaction is signed. New here? Start with Log in with passkey.";
+    setStatus("Logged out. Your registered passkey, public credential metadata and saved history are kept.");
   });
   if (!state.identity) $("login-passkey").focus();
 });
 
 window.addEventListener("beforeunload", (event) => {
-  if (state.busy || hasPendingResult()) {
+  if (state.busy || hasPendingResult() || state.credentialCreated) {
     event.preventDefault();
     event.returnValue = "";
   }

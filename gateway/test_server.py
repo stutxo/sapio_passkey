@@ -8,6 +8,7 @@ import asyncio
 import json
 from pathlib import Path
 import shutil
+import sqlite3
 import ssl
 import struct
 import subprocess
@@ -16,6 +17,96 @@ import unittest
 from unittest.mock import patch
 
 import server
+
+
+PUBLIC_KEY = "036b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296"
+OTHER_PUBLIC_KEY = "02" + PUBLIC_KEY[2:]
+
+
+def passkey(credential_id="aabb"):
+    return {"credential_id": credential_id, "public_key": PUBLIC_KEY}
+
+
+class PasskeyStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.path = str(Path(self.directory.name) / "passkeys.sqlite3")
+
+    def open_store(self):
+        store = server.PasskeyStore(self.path)
+        self.addCleanup(store.close)
+        return store
+
+    def test_persistent_immutable_registration_and_missing_lookup(self):
+        store = self.open_store()
+        self.assertEqual(store.register(passkey()), (201, passkey()))
+        store.close()
+        reopened = self.open_store()
+        self.assertEqual(reopened.get("aabb"), passkey())
+        self.assertEqual(reopened.register(passkey()), (200, passkey()))
+        with self.assertRaises(server.HTTPError) as conflict:
+            reopened.register(passkey() | {"public_key": OTHER_PUBLIC_KEY})
+        self.assertEqual(conflict.exception.status, 409)
+        self.assertEqual(reopened.get("aabb"), passkey())
+        with self.assertRaises(server.HTTPError) as missing:
+            reopened.get("bbcc")
+        self.assertEqual(missing.exception.status, 404)
+
+    def test_independent_connections_never_overwrite(self):
+        first, second = self.open_store(), self.open_store()
+        self.assertEqual(first.register(passkey())[0], 201)
+        self.assertEqual(second.register(passkey())[0], 200)
+        with self.assertRaises(server.HTTPError) as conflict:
+            second.register(passkey() | {"public_key": OTHER_PUBLIC_KEY})
+        self.assertEqual(conflict.exception.status, 409)
+        self.assertEqual(first.get("aabb"), passkey())
+
+    def test_malformed_disk_record_is_not_returned_or_replaced(self):
+        store = self.open_store()
+        with sqlite3.connect(self.path) as db:
+            db.execute("INSERT INTO passkeys VALUES (?, ?)", ("aabb", "02" + "ff" * 32))
+        for operation in (lambda: store.get("aabb"), lambda: store.register(passkey())):
+            with self.assertRaises(server.HTTPError) as invalid:
+                operation()
+            self.assertEqual(invalid.exception.status, 503)
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT public_key FROM passkeys").fetchone()[0],
+                             "02" + "ff" * 32)
+
+    def test_full_database_preserves_records_and_bounds_disk(self):
+        with patch.object(server, "MAX_PASSKEY_PAGES", 8):
+            store = self.open_store()
+            first = passkey("00" * 1024)
+            store.register(first)
+            for number in range(1, 100):
+                try:
+                    store.register(passkey(number.to_bytes(1024, "big").hex()))
+                except server.HTTPError as error:
+                    self.assertEqual(error.status, 507)
+                    break
+            else:
+                self.fail("bounded registry never filled")
+            self.assertEqual(store.get(first["credential_id"]), first)
+            self.assertEqual(store.register(first), (200, first))
+            self.assertLessEqual(sum(path.stat().st_size for path in Path(self.directory.name).iterdir()),
+                                 8 * server.PASSKEY_PAGE_SIZE * 4)
+            store.close()
+            self.assertEqual(self.open_store().get(first["credential_id"]), first)
+
+    def test_locked_storage_fails_without_partial_registration(self):
+        store = self.open_store()
+        with sqlite3.connect(self.path) as lock:
+            lock.execute("BEGIN IMMEDIATE")
+            with self.assertRaises(server.HTTPError) as unavailable:
+                store.register(passkey())
+            self.assertEqual(unavailable.exception.status, 503)
+        self.assertEqual(store.register(passkey()), (201, passkey()))
+
+    def test_ephemeral_paths_are_rejected(self):
+        for path in ("", ":memory:"):
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                server.PasskeyStore(path)
 
 
 def envelope():
@@ -81,9 +172,12 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.esplora = await asyncio.start_server(esplora, "127.0.0.1", 0)
         self.oracle = await asyncio.start_server(oracle, "127.0.0.1", 0)
         self.esplora_url = f"http://127.0.0.1:{self.esplora.sockets[0].getsockname()[1]}/api"
+        self.directory = tempfile.TemporaryDirectory()
+        self.passkey_db = str(Path(self.directory.name) / "passkeys.sqlite3")
         self.relay = server.Relay("http://localhost:8123", "http://localhost:8000",
                                   "127.0.0.1", self.oracle.sockets[0].getsockname()[1],
-                                  "local-dev", "regtest", self.esplora_url)
+                                  "local-dev", "regtest", self.esplora_url,
+                                  passkey_db=self.passkey_db)
         self.listener = server.open_listener("127.0.0.1", 0)
         self.port = self.listener.getsockname()[1]
         self.acceptor = asyncio.create_task(server.accept_connections(self.listener, self.relay))
@@ -98,6 +192,8 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         await self.oracle.wait_closed()
         for writer in tuple(self.peers):
             writer.close()
+        self.relay.close()
+        self.directory.cleanup()
 
     def chain_reply(self, body, status=200, extra=b""):
         self.chain_response = (f"HTTP/1.1 {status} Fixture\r\nContent-Length: {len(body)}\r\n"
@@ -109,7 +205,8 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         values = {"Host": "localhost:8123", "Origin": "http://localhost:8000",
                   "Content-Length": str(len(body))}
         if method == "POST":
-            values["Content-Type"] = "application/json" if path == "/api/sign" else "text/plain"
+            values["Content-Type"] = ("application/json"
+                                      if path in ("/api/sign", "/api/passkeys") else "text/plain")
         if headers:
             for key, value in headers.items():
                 if value is None:
@@ -140,6 +237,62 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Access-Control-Allow-Credentials", headers)
         self.assertNotIn("Set-Cookie", headers)
 
+
+    async def test_registry_roundtrip_idempotency_conflict_and_missing(self):
+        body = json.dumps(passkey()).encode()
+        for expected in (201, 200):
+            status, headers, response = await self.request(body, path="/api/passkeys")
+            self.assertEqual((status, json.loads(response)), (expected, passkey()))
+            self.assert_cors(headers)
+        conflict = json.dumps(passkey() | {"public_key": OTHER_PUBLIC_KEY}).encode()
+        self.assertEqual((await self.request(conflict, path="/api/passkeys"))[0], 409)
+        status, headers, response = await self.request(method="GET", path="/api/passkeys/aabb")
+        self.assertEqual((status, json.loads(response)), (200, passkey()))
+        self.assert_cors(headers)
+        self.assertEqual((await self.request(method="GET", path="/api/passkeys/ccdd"))[0], 404)
+        self.assertEqual(self.received, [])
+        self.assertEqual(self.chain_requests, [])
+
+    async def test_registry_rejects_malformed_and_oversized_registration(self):
+        malformed = [
+            {}, passkey() | {"extra": True}, passkey() | {"credential_id": ""},
+            passkey("a"), passkey("AA"), passkey("aa" * 1025), passkey("../aa"),
+            passkey() | {"credential_id": 123}, passkey() | {"public_key": PUBLIC_KEY.upper()},
+            passkey() | {"public_key": "04" + PUBLIC_KEY[2:]},
+            passkey() | {"public_key": "02" + "ff" * 32},
+            passkey() | {"public_key": "02" + "00" * 31 + "01"},
+            passkey() | {"public_key": None},
+        ]
+        bodies = [json.dumps(record).encode() for record in malformed]
+        bodies += [b'{"credential_id":"aa","credential_id":"bb","public_key":null}',
+                   b'{"credential_id":NaN}', b"\xff"]
+        for body in bodies:
+            with self.subTest(body=body[:100]):
+                self.assertEqual((await self.request(body, path="/api/passkeys"))[0], 400)
+        self.assertEqual((await self.request(b"{}", path="/api/passkeys",
+                          headers={"Content-Length": str(server.MAX_PASSKEY_BODY + 1)}))[0], 413)
+        maximum_record = passkey("ab" * 1024)
+        status, _headers, response = await self.request(json.dumps(maximum_record).encode(),
+                                                      path="/api/passkeys")
+        self.assertEqual((status, json.loads(response)), (201, maximum_record))
+        self.assertEqual((await self.request(method="GET", path="/api/passkeys/aabb"))[0], 404)
+
+    async def test_registry_origin_and_route_boundaries(self):
+        body = json.dumps(passkey()).encode()
+        for path, method in (("/api/passkeys", "POST"), ("/api/passkeys/aabb", "GET")):
+            for origin in (None, "null", "http://localhost:8000/", "https://evil.invalid"):
+                status, headers, _response = await self.request(
+                    body if method == "POST" else b"", method=method, path=path,
+                    headers={"Origin": origin})
+                self.assertEqual(status, 403)
+                self.assert_cors(headers)
+        self.assertEqual((await self.request(method="GET", path="/api/passkeys/aabb"))[0], 404)
+        for path in ("/api/passkeys/", "/api/passkeys/AA", "/api/passkeys/a",
+                     "/api/passkeys/aabb?x=y", "/api/passkeys/%61%61"):
+            self.assertEqual((await self.request(method="GET", path=path))[0], 404)
+        for method, path in (("GET", "/api/passkeys"), ("DELETE", "/api/passkeys/aabb"),
+                             ("POST", "/api/passkeys/aabb"), ("PUT", "/api/passkeys")):
+            self.assertEqual((await self.request(body, method=method, path=path))[0], 405)
     async def test_exact_oracle_bytes_both_directions_and_one_connection(self):
         body = (" \n" + json.dumps(envelope(), indent=2) + "\t").encode()
         for response in (self.response, b' { "SignedV1": [0,0,0,1,255] }\n'):
@@ -165,7 +318,8 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_preflight_validates_origin_route_method_and_requested_headers(self):
         for path, method in (("/api/sign", "POST"), ("/esplora/tx", "POST"),
-                             ("/esplora/blocks/tip/hash", "GET")):
+                             ("/esplora/blocks/tip/hash", "GET"), ("/api/passkeys", "POST"),
+                             ("/api/passkeys/aabb", "GET")):
             request_headers = {"Access-Control-Request-Method": method}
             if method == "POST":
                 request_headers["Access-Control-Request-Headers"] = "Content-Type"
@@ -428,10 +582,12 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             args = server.parser().parse_args([
                 "--api-url", "https://127.0.0.1", "--origin", "https://owner.github.io",
                 "--tls-cert", str(cert), "--tls-key", str(key),
+                "--passkey-db", self.passkey_db,
                 "--upstream-port", str(self.oracle.sockets[0].getsockname()[1])])
             relay, context = server.configure(args)
             self.acceptor.cancel()
             await asyncio.gather(self.acceptor, return_exceptions=True)
+            self.relay.close()
             self.relay = relay
             self.listener = server.open_listener("127.0.0.1", 0)
             self.port = self.listener.getsockname()[1]
@@ -459,9 +615,15 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.passkey_db = str(Path(self.directory.name) / "passkeys.sqlite3")
+
     def arguments(self, *extra):
         return server.parser().parse_args([
-            "--api-url", "https://api.example.test", "--origin", "https://owner.github.io", *extra])
+            "--api-url", "https://api.example.test", "--origin", "https://owner.github.io",
+            "--passkey-db", self.passkey_db, *extra])
 
     def test_production_has_no_implicit_plaintext_or_non_loopback_proxy(self):
         for extra in ((), ("--tls-cert", "/missing"), ("--tls-key", "/missing"),
@@ -484,12 +646,12 @@ class ConfigurationTests(unittest.TestCase):
                        "http://wallet.example.test", "null", "*"):
             for api, frontend in ((origin, "https://owner.github.io"), ("https://api.example.test", origin)):
                 with self.subTest(api=api, frontend=frontend), self.assertRaises(ValueError):
-                    server.Relay(api, frontend, mode="https-proxy")
+                    server.Relay(api, frontend, mode="https-proxy", passkey_db=self.passkey_db)
 
     def test_ip_api_does_not_allow_ip_frontend(self):
         for origin in ("https://127.0.0.1", "https://[::1]"):
             with self.subTest(origin=origin), self.assertRaises(ValueError):
-                server.Relay("https://127.0.0.1", origin, mode="https-proxy")
+                server.Relay("https://127.0.0.1", origin, mode="https-proxy", passkey_db=self.passkey_db)
 
     def test_plaintext_requires_both_loopback_origins_and_explicit_opt_in(self):
         for extra in ((), ("--https-proxy",), ("--allow-local-dev", "--listen", "0.0.0.0")):
@@ -500,7 +662,7 @@ class ConfigurationTests(unittest.TestCase):
                             ("http://localhost:8123", "http://evil.invalid"),
                             ("https://api.example.test", "http://localhost:8000")):
             with self.subTest(api=api, origin=origin), self.assertRaises(ValueError):
-                server.Relay(api, origin, mode="local-dev")
+                server.Relay(api, origin, mode="local-dev", passkey_db=self.passkey_db)
 
     def test_esplora_destination_cannot_escape_pinned_chain(self):
         self.assertEqual(server.validate_esplora_url(None, "mutinynet", False).geturl(),

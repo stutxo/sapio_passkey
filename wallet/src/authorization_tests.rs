@@ -119,8 +119,12 @@ fn assertion(key: &SigningKey, challenge: &[u8; 32], origin: &str) -> Value {
         "origin": origin, "crossOrigin": false,
     }))
     .unwrap();
-    let mut message = auth.clone();
-    message.extend_from_slice(&contract::hash(&client));
+    signed_assertion(key, &auth, &client)
+}
+
+fn signed_assertion(key: &SigningKey, auth: &[u8], client: &[u8]) -> Value {
+    let mut message = auth.to_vec();
+    message.extend_from_slice(&contract::hash(client));
     let signature: Signature = key.sign(&message);
     json!({
         "credential_id": hex::encode([0xab; 32]),
@@ -352,67 +356,221 @@ fn finalization_rejects_wire_smuggling_and_foreign_policy() {
     .is_err());
 }
 
+fn login_body(f: &Fixture, nonce: [u8; 32]) -> Value {
+    let app = f.context.validate().unwrap();
+    let challenge = dispatch(
+        &app,
+        "login_challenge",
+        json!({"nonce": hex::encode(nonce)}),
+    )
+    .unwrap();
+    let challenge: [u8; 32] = hex::decode(challenge["challenge"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    json!({
+        "nonce": hex::encode(nonce), "public_key": f.public_key,
+        "credential_id": hex::encode([0xab; 32]),
+        "assertion": assertion(&f.credential, &challenge, ORIGIN),
+    })
+}
+
 #[test]
-fn stateless_restoration_binds_two_indexed_assertions_and_original_json() {
+fn one_login_assertion_requires_the_registered_key_credential_and_fresh_nonce() {
     let f = fixture();
     let app = f.context.validate().unwrap();
-    let nonce = [31; 32];
-    let challenges = restoration_challenges(&app, &nonce);
-    // Independent byte framing keeps the existing recovery protocol stable.
-    for (index, challenge) in challenges.iter().enumerate() {
-        let mut committed = b"sapio-passkey/restore/v1\0".to_vec();
-        committed.extend_from_slice(&nonce);
-        committed.push(index as u8);
-        committed.extend_from_slice(&contract::hash(contract::WASM));
-        committed.extend_from_slice(
-            &bitcoin::blockdata::constants::genesis_block(Network::Regtest)
-                .block_hash()
-                .to_byte_array(),
-        );
-        committed.extend_from_slice(&app.root.encode());
-        committed.extend_from_slice(&contract::hash(RP_ID.as_bytes()));
-        committed.extend_from_slice(&contract::hash(ORIGIN.as_bytes()));
-        assert_eq!(*challenge, contract::hash(&committed));
-    }
-    let approvals = challenges.map(|challenge| assertion(&f.credential, &challenge, ORIGIN));
-    let body = json!({"nonce": hex::encode(nonce), "assertions": approvals});
-    let recovered = dispatch(&app, "restore", body.clone()).unwrap();
-    assert_eq!(recovered["public_key"], f.public_key);
-    assert_eq!(recovered["credential_id"], hex::encode([0xab; 32]));
-    let mut repeated = body.clone();
-    repeated["assertions"][1] = repeated["assertions"][0].clone();
-    assert!(dispatch(&app, "restore", repeated).is_err());
-    let mut mismatched = body.clone();
-    mismatched["assertions"][1]["credential_id"] = json!(hex::encode([0xcd; 32]));
-    assert!(dispatch(&app, "restore", mismatched).is_err());
+    let body = login_body(&f, [31; 32]);
+    let identity = dispatch(&app, "login", body.clone()).unwrap();
+    let wallet = dispatch(
+        &app,
+        "wallet",
+        json!({"public_key": identity["public_key"]}),
+    )
+    .unwrap();
+    let instance = policy(&app, &f.public_key).unwrap();
+    assert_eq!(
+        wallet["address"],
+        contract::address(&instance, app.root, app.network)
+            .unwrap()
+            .to_string()
+    );
+
+    let other = SigningKey::from_bytes((&[8u8; 32]).into()).unwrap();
+    let mut wrong_key = body.clone();
+    wrong_key["public_key"] = json!(hex::encode(other.verifying_key().to_encoded_point(true)));
+    assert!(dispatch(&app, "login", wrong_key).is_err());
+    let mut wrong_signer = body.clone();
+    wrong_signer["assertion"] = assertion(&other, &login_challenge(&app, &[31; 32]), ORIGIN);
+    assert!(dispatch(&app, "login", wrong_signer).is_err());
+    let mut wrong_id = body.clone();
+    wrong_id["assertion"]["credential_id"] = json!(hex::encode([0xcd; 32]));
+    assert!(dispatch(&app, "login", wrong_id).is_err());
+    let mut empty_id = body.clone();
+    empty_id["credential_id"] = json!("");
+    empty_id["assertion"]["credential_id"] = json!("");
+    assert!(dispatch(&app, "login", empty_id).is_err());
+
+    // A previous assertion cannot satisfy a newly generated login challenge.
     let mut stale = body.clone();
     stale["nonce"] = json!(hex::encode([32; 32]));
-    assert!(dispatch(&app, "restore", stale).is_err());
-    let other = SigningKey::from_bytes((&[8u8; 32]).into()).unwrap();
-    let mut different_key = body.clone();
-    different_key["assertions"][1] = assertion(&other, &challenges[1], ORIGIN);
-    assert!(dispatch(&app, "restore", different_key).is_err());
+    assert!(dispatch(&app, "login", stale).is_err());
+    dispatch(&app, "login", login_body(&f, [32; 32])).unwrap();
+    for invalid in [
+        "AA".repeat(32),
+        "00".repeat(31),
+        "00".repeat(33),
+        "gg".repeat(32),
+    ] {
+        assert!(dispatch(&app, "login_challenge", json!({"nonce": invalid})).is_err());
+        let mut malformed = body.clone();
+        malformed["nonce"] = json!(invalid);
+        assert!(dispatch(&app, "login", malformed).is_err());
+    }
+}
 
-    let mut duplicate = body;
-    let original = hex::decode(
-        duplicate["assertions"][0]["client_data_json"]
-            .as_str()
-            .unwrap(),
+#[test]
+fn login_is_bound_to_the_app_context_and_authenticator_checks() {
+    let f = fixture();
+    let app = f.context.validate().unwrap();
+    let body = login_body(&f, [31; 32]);
+    let mut other_root = f.context.clone();
+    other_root.identity.xpub = Xpub::from_priv(
+        &Secp256k1::new(),
+        &Xpriv::new_master(Network::Regtest, &[43; 32]).unwrap(),
+    );
+    let mut other_origin = f.context.clone();
+    other_origin.origin = "http://localhost:8081".into();
+    let mut other_network = f.context.clone();
+    other_network.identity.mode = "nitro".into();
+    other_network.identity.settings = json!({"network": "signet"});
+    for context in [other_root, other_origin, other_network] {
+        assert!(dispatch(&context.validate().unwrap(), "login", body.clone()).is_err());
+    }
+
+    let original_auth =
+        hex::decode(body["assertion"]["authenticator_data"].as_str().unwrap()).unwrap();
+    let client = hex::decode(body["assertion"]["client_data_json"].as_str().unwrap()).unwrap();
+    let mut wrong_rp = original_auth.clone();
+    wrong_rp[..32].copy_from_slice(&contract::hash(b"other.example"));
+    let mut no_presence = original_auth.clone();
+    no_presence[32] = 4;
+    let mut no_verification = original_auth.clone();
+    no_verification[32] = 1;
+    let mut invalid_backup = original_auth;
+    invalid_backup[32] = 0x15;
+    for auth in [wrong_rp, no_presence, no_verification, invalid_backup] {
+        let mut invalid = body.clone();
+        // These are valid signatures, so rejection must enforce the signed context/flags.
+        invalid["assertion"] = signed_assertion(&f.credential, &auth, &client);
+        assert!(dispatch(&app, "login", invalid).is_err());
+    }
+}
+
+#[test]
+fn login_preserves_original_json_and_accepts_high_s_es256() {
+    let f = fixture();
+    let app = f.context.validate().unwrap();
+    let mut body = login_body(&f, [31; 32]);
+    let auth = hex::decode(body["assertion"]["authenticator_data"].as_str().unwrap()).unwrap();
+    let challenge = URL_SAFE_NO_PAD.encode(login_challenge(&app, &[31; 32]));
+    let client = format!(
+        "{{ \"origin\": \"{ORIGIN}\", \"challenge\": \"{challenge}\", \"type\": \"webauthn.get\", \"extra\": true }}"
+    );
+    body["assertion"] = signed_assertion(&f.credential, &auth, client.as_bytes());
+    dispatch(&app, "login", body.clone()).unwrap();
+
+    let mut rewritten = body.clone();
+    let parsed: Value = serde_json::from_str(&client).unwrap();
+    rewritten["assertion"]["client_data_json"] =
+        json!(hex::encode(serde_json::to_vec(&parsed).unwrap()));
+    assert!(dispatch(&app, "login", rewritten).is_err());
+
+    let signature = Signature::from_der(
+        &hex::decode(body["assertion"]["signature"].as_str().unwrap()).unwrap(),
     )
     .unwrap();
-    let original = std::str::from_utf8(&original).unwrap();
-    let client = format!("{{\"origin\":\"{ORIGIN}\",{}", &original[1..]);
-    let mut message = hex::decode(
-        duplicate["assertions"][0]["authenticator_data"]
-            .as_str()
-            .unwrap(),
-    )
+    let low = signature.normalize_s().unwrap_or(signature);
+    let (r, s) = low.split_scalars();
+    let high = Signature::from_scalars(r.to_bytes(), (-s).to_bytes()).unwrap();
+    for signature in [low, high] {
+        body["assertion"]["signature"] = json!(hex::encode(signature.to_der()));
+        dispatch(&app, "login", body.clone()).unwrap();
+    }
+
+    for extra in [
+        format!("\"origin\":\"{ORIGIN}\","),
+        format!("\"ori\\u0067in\":\"{ORIGIN}\","),
+        "\"topOrigin\":null,".into(),
+        "\"crossOrigin\":true,".into(),
+    ] {
+        let invalid_client = format!("{{{extra}{}", &client[1..]);
+        let mut invalid = body.clone();
+        invalid["assertion"] = signed_assertion(&f.credential, &auth, invalid_client.as_bytes());
+        assert!(dispatch(&app, "login", invalid).is_err());
+    }
+    for (field, value) in [
+        ("origin", "http://localhost:8081".to_owned()),
+        ("type", "webauthn.create".to_owned()),
+        ("challenge", format!("{challenge}=")),
+    ] {
+        let mut invalid_client = parsed.clone();
+        invalid_client[field] = json!(value);
+        let mut invalid = body.clone();
+        invalid["assertion"] = signed_assertion(
+            &f.credential,
+            &auth,
+            &serde_json::to_vec(&invalid_client).unwrap(),
+        );
+        assert!(dispatch(&app, "login", invalid).is_err());
+    }
+}
+
+#[test]
+fn login_does_not_open_or_approve_a_transaction() {
+    let f = fixture();
+    let app = f.context.validate().unwrap();
+    let body = login_body(&f, [31; 32]);
+    let mut session =
+        crate::WalletSession::new(&serde_json::to_string(&f.context).unwrap()).unwrap();
+    let logged_in: Value =
+        serde_json::from_str(&session.call("login", &body.to_string(), 1.0)).unwrap();
+    assert!(logged_in.get("ok").is_some());
+    let signing_body = json!({
+        "public_key": f.public_key, "psbt": STANDARD.encode(f.psbt.serialize()),
+        "input_index": 0, "nonce": body["nonce"],
+        "authenticator_data": body["assertion"]["authenticator_data"],
+        "client_data_json": body["assertion"]["client_data_json"],
+        "signature": body["assertion"]["signature"],
+    });
+    let before_open: Value =
+        serde_json::from_str(&session.call("request", &signing_body.to_string(), 1.0)).unwrap();
+    assert!(before_open.get("error").is_some());
+    let opened: Value = serde_json::from_str(&session.call(
+        "open",
+        &json!({"public_key": f.public_key}).to_string(),
+        1.0,
+    ))
     .unwrap();
-    message.extend_from_slice(&contract::hash(client.as_bytes()));
-    let signature: Signature = f.credential.sign(&message);
-    duplicate["assertions"][0]["client_data_json"] = json!(hex::encode(client.as_bytes()));
-    duplicate["assertions"][0]["signature"] = json!(hex::encode(signature.to_der()));
-    assert!(dispatch(&app, "restore", duplicate).is_err());
+    assert!(opened.get("ok").is_some());
+    let unreviewed: Value =
+        serde_json::from_str(&session.call("request", &signing_body.to_string(), 1.0)).unwrap();
+    assert!(unreviewed.get("error").is_some());
+
+    // The policy's transaction/input-bound challenge is not the login challenge,
+    // even when the nonce, registered key, RP and origin are identical.
+    let instance = policy(&app, &f.public_key).unwrap();
+    let login_approval: LoginAssertion = serde_json::from_value(body["assertion"].clone()).unwrap();
+    for input_index in 0..f.psbt.inputs.len() {
+        let view = contract::signed_view(&f.psbt, input_index as u32).unwrap();
+        let transaction_challenge = contract::challenge(instance.parameters(), &view, &[31; 32]);
+        assert!(verify_login_assertion(
+            &app,
+            &login_approval,
+            &transaction_challenge,
+            f.credential.verifying_key(),
+        )
+        .is_err());
+    }
 }
 
 #[test]

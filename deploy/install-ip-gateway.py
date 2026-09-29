@@ -88,7 +88,9 @@ After=network-online.target
 [Service]
 Type=exec
 DynamicUser=yes
-ExecStart={PYTHON} -I -B {APP}/server.py --api-url https://{ip} --origin {origin} --listen 0.0.0.0 --port 443 --tls-cert %d/fullchain.pem --tls-key %d/privkey.pem
+StateDirectory=sapio-passkey
+StateDirectoryMode=0700
+ExecStart={PYTHON} -I -B {APP}/server.py --api-url https://{ip} --origin {origin} --listen 0.0.0.0 --port 443 --tls-cert %d/fullchain.pem --tls-key %d/privkey.pem --passkey-db /var/lib/sapio-passkey/passkeys.sqlite3
 LoadCredential=fullchain.pem:{CONFIG}/live/{ip}/fullchain.pem
 LoadCredential=privkey.pem:{CONFIG}/live/{ip}/privkey.pem
 Restart=on-failure

@@ -25,7 +25,7 @@ from urllib.parse import urlsplit
 ROOT = Path(__file__).resolve().parent.parent
 PRESET_SHA256 = "2014810c930b4804bd1d52fae2b602578a9e5cccc29cb666f064356756154a1e"
 POLICY_SHA256 = "eaef7663d2c61d8bc43ad456baa583dcfa4a8ab95e26a18605783831f64a462b"
-ASSETS = ("app.js", "index.html", "style.css", "wallet.js")
+ASSETS = ("app.js", "index.html", "qr.js", "style.css", "wallet.js")
 BINDINGS = ("sapio_passkey_wallet.js", "sapio_passkey_wallet_bg.wasm")
 
 

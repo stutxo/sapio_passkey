@@ -2,23 +2,24 @@
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 body { margin: 0; }
-main { max-width: 720px; margin: auto; padding: 24px; overflow-wrap: anywhere; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+main { max-width: 480px; margin: auto; padding: 24px; overflow-wrap: anywhere; }
 header { margin-bottom: 20px; }
-h1 { margin: 8px 0; font-size: 1.75rem; line-height: 1.2; }
+h1 { margin: 8px 0; font-size: 1rem; line-height: 1.2; }
 h2 { margin: 0 0 12px; font-size: 1.2rem; }
 p { margin: 12px 0; }
 a { color: inherit; text-underline-offset: 3px; }
-section { margin: 24px 0; padding-top: 24px; border-top: 1px solid; }
+section { margin: 24px 0; }
 .header-row, .status-bar, .wallet-actions, .address-row { display: flex; align-items: center; gap: 12px; }
 .header-row, .status-bar { justify-content: space-between; }
 .header-row p { margin: 0; }
 .wallet-actions { flex-wrap: wrap; margin-top: 16px; }
-.status-bar, .approval-note, .trust-notes, dt { font-size: .875rem; }
+.header-row, .status-bar, .approval-note, .trust-notes, dt, footer { font-size: .875rem; }
 .notice, .error { border: 1px solid; padding: 12px; }
 #new-wallet-panel { margin-top: 20px; padding-left: 16px; border-left: 2px solid; }
 button, input, textarea { font: inherit; color: inherit; background: #fff; border: 1px solid; border-radius: 2px; }
 button { min-height: 44px; max-width: 100%; padding: 8px 14px; cursor: pointer; }
-button:hover:not(:disabled), #send-max[aria-pressed="true"] { background: #000; color: #fff; }
+button:hover:not(:disabled) { background: #000; color: #fff; }
 button:disabled, input:disabled { opacity: .5; cursor: not-allowed; }
 button.quiet { text-decoration: underline; text-underline-offset: 3px; }
 :focus-visible { outline: 2px solid #000; outline-offset: 4px; }
@@ -26,16 +27,25 @@ label { display: block; margin: 16px 0 6px; }
 input, textarea { display: block; width: 100%; min-width: 0; min-height: 44px; padding: 8px; }
 input::placeholder { color: #000; opacity: .6; }
 textarea { resize: vertical; overflow-wrap: anywhere; }
-.address-row input { flex: 1; }
+.address-row { align-items: flex-start; }
+.address-row details { flex: 1; min-width: 0; }
+.address-row summary { min-height: 44px; }
+#receive-address-short, #receive-address { font-size: .75rem; }
+#receive-qr { width: 192px; max-width: 100%; margin: 16px 0; }
+#receive-qr svg, #receive-qr canvas { display: block; width: 100%; height: auto; }
 .address-row button { flex-shrink: 0; }
 .available { margin: 0 0 16px; }
 .available dd { font-size: 2rem; font-weight: 600; }
 .balances { display: grid; gap: 12px; }
 .balances > div { display: flex; justify-content: space-between; gap: 12px; }
 dd { margin: 0; min-width: 0; font-variant-numeric: tabular-nums; }
-#receive-heading { margin-top: 28px; }
-.form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
-.payment { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 12px; margin: 20px 0; }
+.amount-row { display: flex; align-items: center; gap: 12px; }
+.amount-row > input { flex: 1; }
+.max-option { display: flex; align-items: center; flex-shrink: 0; gap: 8px; margin: 0; min-height: 44px; cursor: pointer; }
+.max-option input { width: 20px; height: 20px; min-height: 0; margin: 0; padding: 0; accent-color: #000; }
+#fee-settings { margin-top: 8px; }
+#review-payment, #send-payment { width: 100%; margin-top: 16px; }
+.payment { display: grid; grid-template-columns: 100px minmax(0, 1fr); gap: 12px; margin: 20px 0; }
 .amount, .history-state { font-weight: 600; }
 .mono { font-family: ui-monospace, monospace; font-size: .875rem; }
 summary { padding: 8px 0; cursor: pointer; }
@@ -45,10 +55,9 @@ summary { padding: 8px 0; cursor: pointer; }
 .history-list > li { padding: 16px 0; border-bottom: 1px solid; }
 .history-list p { margin: 4px 0; }
 .trust-notes { margin-top: 28px; border-top: 1px solid; padding-top: 12px; }
+footer { margin-top: 24px; }
 @media (max-width: 480px) {
   main { padding: 20px 16px; }
-  .form-grid { grid-template-columns: 1fr; gap: 0; }
-  .address-row { align-items: stretch; flex-direction: column; }
   .payment { grid-template-columns: 1fr; gap: 4px; }
   .payment dd { margin-bottom: 12px; }
   .status-bar { align-items: flex-start; }

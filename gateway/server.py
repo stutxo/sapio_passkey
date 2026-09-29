@@ -2,6 +2,7 @@
 """External HTTPS gateway for a static Pages passkey wallet (Python 3.11+).
 
 POST /api/sign forwards the unchanged ProgramOracle wire envelope.
+POST /api/passkeys and GET /api/passkeys/credential-id store public metadata only.
 /esplora exposes only fixed-destination native Esplora routes, never a URL proxy.
 No static files, cookies, redirects, compression, connection reuse or retries.
 """
@@ -13,6 +14,7 @@ import ipaddress
 import json
 import re
 import socket
+import sqlite3
 import ssl
 import struct
 from urllib.parse import urlsplit
@@ -22,6 +24,12 @@ MAX_MESSAGE = 1024 * 1024
 MAX_HEADERS = 16 * 1024
 MAX_CONNECTIONS = 4
 TIMEOUT = 30
+MAX_PASSKEY_BODY = 2304
+PASSKEY_PAGE_SIZE = 4096
+MAX_PASSKEY_PAGES = 4096  # 16 MiB database; rollback journal is also bounded.
+CREDENTIAL_ID = r"(?:[0-9a-f]{2}){1,1024}"
+P256_P = 0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF
+P256_B = 0x5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B
 MUTINYNET_ESPLORA = "https://mutinynet.com/api"
 TXID = r"[0-9a-f]{64}"
 NUMBER = r"(?:0|[1-9][0-9]{0,9})"
@@ -43,8 +51,10 @@ SECURITY_HEADERS = (
 
 
 class HTTPError(Exception):
-    def __init__(self, status):
+    def __init__(self, status, code=None):
         self.status = status
+        self.body = (json.dumps({"error": code}, separators=(",", ":")).encode()
+                     if code is not None else None)
 
 
 def require(condition, message):
@@ -71,6 +81,109 @@ def json_value(data):
                           parse_constant=invalid_constant)
     except (UnicodeError, RecursionError) as error:
         raise ValueError("invalid JSON encoding or nesting") from error
+
+
+def validate_credential_id(value):
+    require(isinstance(value, str) and re.fullmatch(CREDENTIAL_ID, value),
+            "invalid credential ID")
+
+
+def validate_passkey(value):
+    require(isinstance(value, dict) and set(value) == {"credential_id", "public_key"},
+            "expected credential ID and public key")
+    validate_credential_id(value["credential_id"])
+    key = value["public_key"]
+    require(isinstance(key, str) and re.fullmatch(r"0[23][0-9a-f]{64}", key),
+            "invalid compressed P-256 public key")
+    x = int(key[2:], 16)
+    require(x < P256_P, "invalid P-256 coordinate")
+    squared_y = (pow(x, 3, P256_P) - 3 * x + P256_B) % P256_P
+    y = pow(squared_y, (P256_P + 1) // 4, P256_P)
+    require(y * y % P256_P == squared_y and (y != 0 or key[:2] == "02"),
+            "public key is not on P-256")
+    return value
+
+
+def passkey_storage_error(error):
+    full = getattr(error, "sqlite_errorcode", 0) & 255 == sqlite3.SQLITE_FULL
+    return HTTPError(507 if full else 503,
+                     "passkey_registry_full" if full else "passkey_registry_unavailable")
+
+
+class PasskeyStore:
+    """Immutable public metadata, never attestation or spending authorization."""
+
+    def __init__(self, path):
+        require(isinstance(path, str) and path and path != ":memory:",
+                "--passkey-db must name a persistent SQLite file")
+        self.db = sqlite3.connect(path, timeout=0, isolation_level=None)
+        try:
+            self.db.execute(f"PRAGMA page_size={PASSKEY_PAGE_SIZE}")
+            require(self.db.execute("PRAGMA page_size").fetchone()[0] == PASSKEY_PAGE_SIZE,
+                    "passkey database has an unsupported page size")
+            require(self.db.execute("PRAGMA page_count").fetchone()[0] <= MAX_PASSKEY_PAGES,
+                    "passkey database exceeds the storage limit")
+            self.db.execute(f"PRAGMA max_page_count={MAX_PASSKEY_PAGES}")
+            # No WAL accumulation or disk-backed temporary/statement journals.
+            # A single bounded-row INSERT can journal only existing bounded DB
+            # pages; DELETE removes that rollback journal at each transaction end.
+            # Database + transient journal remain below 64 MiB, even at capacity.
+            require(self.db.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete",
+                    "passkey database requires rollback journaling")
+            self.db.execute("PRAGMA journal_size_limit=0")
+            self.db.execute("PRAGMA synchronous=FULL")
+            # Avoid spill-driven journal header growth; the whole DB is bounded.
+            self.db.execute("PRAGMA cache_spill=OFF")
+            self.db.execute("PRAGMA temp_store=MEMORY")
+            self.db.execute("PRAGMA trusted_schema=OFF")
+            self.db.execute("""
+                CREATE TABLE IF NOT EXISTS passkeys (
+                    credential_id TEXT PRIMARY KEY NOT NULL
+                        CHECK(length(credential_id) BETWEEN 2 AND 2048),
+                    public_key TEXT NOT NULL CHECK(length(public_key) = 66)
+                ) WITHOUT ROWID
+            """)
+        except BaseException:
+            self.db.close()
+            raise
+
+    def close(self):
+        self.db.close()
+
+    def get(self, credential_id):
+        validate_credential_id(credential_id)
+        try:
+            row = self.db.execute("SELECT public_key FROM passkeys WHERE credential_id = ?",
+                                  (credential_id,)).fetchone()
+        except sqlite3.Error as error:
+            raise passkey_storage_error(error) from error
+        if row is None:
+            raise HTTPError(404)
+        try:
+            return validate_passkey({"credential_id": credential_id, "public_key": row[0]})
+        except ValueError as error:
+            raise HTTPError(503, "passkey_registry_invalid_record") from error
+
+    def register(self, record):
+        validate_passkey(record)
+        try:
+            # Serialize read-before-insert across processes, not just this loop.
+            with self.db:
+                self.db.execute("BEGIN IMMEDIATE")
+                try:
+                    existing = self.get(record["credential_id"])
+                except HTTPError as error:
+                    if error.status != 404:
+                        raise
+                else:
+                    if existing != record:
+                        raise HTTPError(409)
+                    return 200, existing
+                self.db.execute("INSERT INTO passkeys (credential_id, public_key) VALUES (?, ?)",
+                                (record["credential_id"], record["public_key"]))
+            return 201, record
+        except sqlite3.Error as error:
+            raise passkey_storage_error(error) from error
 
 
 def byte_array(value, maximum):
@@ -270,7 +383,7 @@ async def oracle_exchange(body, host, port):
 
 class Relay:
     def __init__(self, api_url, origin, upstream_host="127.0.0.1", upstream_port=8367,
-                 mode="tls", chain="mutinynet", esplora_url=None):
+                 mode="tls", chain="mutinynet", esplora_url=None, *, passkey_db):
         require(mode in ("tls", "https-proxy", "local-dev"), "invalid gateway mode")
         self.mode = mode
         self.origin = origin
@@ -283,6 +396,10 @@ class Relay:
         self.chain = chain
         self.esplora = validate_esplora_url(esplora_url, chain, mode == "local-dev")
         self.active = 0
+        self.passkeys = PasskeyStore(passkey_db)
+
+    def close(self):
+        self.passkeys.close()
 
     def response(self, status, body=None, content_type="application/json", preflight=None):
         try:
@@ -310,6 +427,12 @@ class Relay:
         await writer.drain()
 
     def route(self, path):
+        if path == "/api/passkeys":
+            return "POST", None, "application/json"
+        if path.startswith("/api/passkeys/"):
+            if re.fullmatch(CREDENTIAL_ID, path.removeprefix("/api/passkeys/")) is None:
+                raise HTTPError(404)
+            return "GET", None, "application/json"
         if path == "/api/sign":
             return "POST", None, "application/json"
         if path == "/esplora/tx":
@@ -387,17 +510,26 @@ class Relay:
             length = headers["content-length"]
             if re.fullmatch(r"[1-9][0-9]{0,6}", length) is None:
                 raise HTTPError(413 if length.isdigit() and len(length) > 6 else 400)
-            if int(length) > MAX_MESSAGE:
+            maximum = MAX_PASSKEY_BODY if path == "/api/passkeys" else MAX_MESSAGE
+            if int(length) > maximum:
                 raise HTTPError(413)
             body = await reader.readexactly(int(length))
             try:
-                if upstream_path is None:
+                if path == "/api/passkeys":
+                    record = validate_passkey(json_value(body))
+                elif upstream_path is None:
                     validate_request(body)
                 else:
                     require(len(body) % 2 == 0 and re.fullmatch(rb"[0-9a-fA-F]+", body),
                             "expected raw transaction hex")
             except ValueError as error:
                 raise HTTPError(400) from error
+        if path == "/api/passkeys":
+            status, record = self.passkeys.register(record)
+            return status, json.dumps(record, separators=(",", ":")).encode(), content_type, None
+        if path.startswith("/api/passkeys/"):
+            record = self.passkeys.get(path.removeprefix("/api/passkeys/"))
+            return 200, json.dumps(record, separators=(",", ":")).encode(), content_type, None
         try:
             if upstream_path is None:
                 response = await oracle_exchange(body, self.upstream_host, self.upstream_port)
@@ -440,7 +572,7 @@ class Relay:
             except HTTPError as error:
                 remaining = deadline - asyncio.get_running_loop().time()
                 if writer is not None and remaining > 0:
-                    await asyncio.wait_for(self.respond(writer, error.status), remaining)
+                    await asyncio.wait_for(self.respond(writer, error.status, error.body), remaining)
             except asyncio.IncompleteReadError:
                 remaining = deadline - asyncio.get_running_loop().time()
                 if writer is not None and remaining > 0:
@@ -511,14 +643,15 @@ def parser():
   Direct HTTPS (provide your own certificates):
     python3 gateway/server.py --api-url https://api.example.com:8443 \\
       --origin https://owner.github.io --listen 0.0.0.0 --port 8443 \\
-      --tls-cert /path/fullchain.pem --tls-key /path/privkey.pem
+      --tls-cert /path/fullchain.pem --tls-key /path/privkey.pem --passkey-db /path/passkeys.sqlite3
   Existing HTTPS reverse proxy (preserve Host; set X-Forwarded-Proto: https):
     python3 gateway/server.py --api-url https://api.example.com \\
-      --origin https://owner.github.io --https-proxy --listen 127.0.0.1 --port 8081
+      --origin https://owner.github.io --https-proxy --listen 127.0.0.1 --port 8081 \\
+      --passkey-db /path/passkeys.sqlite3
   Explicit localhost development (frontend served separately on port 8000):
     python3 gateway/server.py --api-url http://localhost:8081 \\
       --origin http://localhost:8000 --allow-local-dev --chain regtest \\
-      --esplora-url http://127.0.0.1:3002
+      --esplora-url http://127.0.0.1:3002 --passkey-db ./passkeys.sqlite3
 
 The Pages wallet-config.json api_url must equal --api-url. --origin is an origin,
 not a Pages path (https://owner.github.io, without /sapio_passkey/ or trailing /).
@@ -527,12 +660,17 @@ GET /esplora/{blocks[/height],blocks/tip/{height,hash},block-height/height,
 block/hash/{status,header},scripthash/hash/txs[/chain/txid|/mempool],
 address/bech32/{utxo,txs[/chain/txid]},tx/txid[/hex|/status|/outspends|/outspend/vout],
 fee-estimates}; POST /esplora/tx takes text/plain raw hex; POST /api/sign takes JSON.
+POST /api/passkeys takes exactly credential_id/public_key lowercase hex (2304 bytes max);
+GET /api/passkeys/credential_id returns that immutable public record, not authorization.
+--passkey-db is required and must be on persistent storage: 16 MiB DB, below 64 MiB
+including transient rollback journal; 507 when full, 503 on storage failure.
 All requests/responses: 1 MiB body, 16 KiB headers, 4 admitted sockets,
 30 seconds total including TLS. Broadcasts and signing are never retried.
 No installation, static file serving, health/setup API, or deployment actions.
 """)
     value.add_argument("--api-url", required=True, help="exact public API origin (DNS name or certified IP); HTTPS except explicit localhost development")
     value.add_argument("--origin", required=True, help="exact allowed frontend origin; HTTPS except explicit localhost development")
+    value.add_argument("--passkey-db", required=True, help="persistent SQLite file for immutable public passkey metadata; parent directory must exist and be writable")
     value.add_argument("--listen", default="127.0.0.1", help="numeric listen IP; proxy and development require loopback")
     value.add_argument("--port", type=int, default=8081, help="listen port (default: 8081)")
     value.add_argument("--tls-cert", help="PEM certificate/full chain for direct HTTPS; requires --tls-key")
@@ -555,22 +693,25 @@ def configure(args):
     require(direct or address.is_loopback, "proxy and development listeners must be loopback")
     require(1 <= args.port <= 65535, "invalid listening port")
     mode = "tls" if direct else "https-proxy" if args.https_proxy else "local-dev"
-    relay = Relay(args.api_url, args.origin, args.upstream_host, args.upstream_port,
-                  mode, args.chain, args.esplora_url)
     context = None
     if direct:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(args.tls_cert, args.tls_key)
+    relay = Relay(args.api_url, args.origin, args.upstream_host, args.upstream_port,
+                  mode, args.chain, args.esplora_url, passkey_db=args.passkey_db)
     return relay, context
 
 
 async def serve(args):
     relay, context = configure(args)
-    listener = open_listener(args.listen, args.port)
-    print(f"wallet gateway ready on {args.listen}:{args.port} ({relay.mode}); "
-          f"API {args.api_url}; frontend {args.origin}; chain {args.chain}", flush=True)
-    await accept_connections(listener, relay, context)
+    try:
+        listener = open_listener(args.listen, args.port)
+        print(f"wallet gateway ready on {args.listen}:{args.port} ({relay.mode}); "
+              f"API {args.api_url}; frontend {args.origin}; chain {args.chain}", flush=True)
+        await accept_connections(listener, relay, context)
+    finally:
+        relay.close()
 
 
 def main():
@@ -580,7 +721,7 @@ def main():
         asyncio.run(serve(args))
     except KeyboardInterrupt:
         pass
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, sqlite3.Error) as error:
         arguments.exit(1, f"wallet gateway failed: {error}\n")
 
 

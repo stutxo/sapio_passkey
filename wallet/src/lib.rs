@@ -85,7 +85,7 @@ impl WalletSession {
     fn dispatch(&mut self, operation: &str, body: Value, now: u64) -> Result<Value> {
         let app = self.context.validate()?;
         match operation {
-            "configure" | "restore_challenges" | "restore" => {
+            "configure" | "login_challenge" | "login" => {
                 authorization::dispatch(&app, operation, body)
             }
             "open" => {
