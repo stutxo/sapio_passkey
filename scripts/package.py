@@ -12,6 +12,8 @@ Serve dist with a static HTTP server; the gateway is a separate process. The API
 URL must be the actual gateway origin, not an Esplora endpoint or raw signer TCP
 address. This command does not deploy anything, fetch an identity or contact an
 API. Choose the final frontend hostname before creating/funding a wallet.
+Modules, WASM and configuration share a content-addressed asset directory so
+browser caches cannot combine assets from different releases.
 """
 import argparse
 import hashlib
@@ -108,27 +110,42 @@ def main():
         parser.error(str(error))
 
     args.out.mkdir(parents=True, exist_ok=False)
-    (args.out / "pkg").mkdir()
+    assets = args.out / "_assets"
+    assets.mkdir()
+    (assets / "pkg").mkdir()
     for name in ASSETS:
-        shutil.copyfile(ROOT / "web" / name, args.out / name)
+        shutil.copyfile(ROOT / "web" / name, (args.out if name == "index.html" else assets) / name)
     for name in BINDINGS:
-        shutil.copyfile(ROOT / "web/pkg" / name, args.out / "pkg" / name)
-    shutil.copyfile(ROOT / "policy/passkey.wasm", args.out / "passkey.wasm")
+        shutil.copyfile(ROOT / "web/pkg" / name, assets / "pkg" / name)
+    shutil.copyfile(ROOT / "policy/passkey.wasm", assets / "passkey.wasm")
     shutil.copyfile(ROOT / "LICENSE", args.out / "LICENSE")
     config = {"version": 1, "identity": identity, "api_url": api, "chain": chain, "allow_local_dev": args.allow_local_dev}
-    (args.out / "wallet-config.json").write_text(json.dumps(config, sort_keys=True, indent=2) + "\n")
+    (assets / "wallet-config.json").write_text(json.dumps(config, sort_keys=True, indent=2) + "\n")
+    asset_files = {}
+    for path in sorted(assets.rglob("*")):
+        if path.is_file():
+            data = path.read_bytes()
+            asset_files[path.relative_to(assets).as_posix()] = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+    asset_digest = hashlib.sha256(json.dumps(asset_files, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    asset_root = Path("assets") / asset_digest
+    (args.out / "assets").mkdir()
+    assets.rename(args.out / asset_root)
     policy = f"default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; connect-src 'self' {api}; img-src 'self' data:; base-uri 'none'; form-action 'none'; object-src 'none'"
     index = (args.out / "index.html").read_text()
     if index.count("<head>") != 1:
         raise SystemExit("frontend must contain exactly one head element")
     index = index.replace("<head>", "<head>\n  <meta http-equiv=\"Content-Security-Policy\" content=\"" + html.escape(policy, quote=True) + "\">\n  <meta name=\"referrer\" content=\"no-referrer\">", 1)
+    for attribute, name in (("href", "style.css"), ("src", "app.js")):
+        reference = f'{attribute}="./{name}"'
+        if index.count(reference) != 1:
+            raise SystemExit(f"frontend must reference exactly one {name}")
+        index = index.replace(reference, f'{attribute}="./{asset_root.as_posix()}/{name}"', 1)
     (args.out / "index.html").write_text(index)
     (args.out / ".nojekyll").write_text("")
-    files = {}
-    for path in sorted(args.out.rglob("*")):
-        if path.is_file():
-            data = path.read_bytes()
-            files[str(path.relative_to(args.out))] = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+    files = {f"{asset_root.as_posix()}/{name}": info for name, info in asset_files.items()}
+    for name in (".nojekyll", "LICENSE", "index.html"):
+        data = (args.out / name).read_bytes()
+        files[name] = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
     manifest = {"version": 1, "chain": chain, "api_url": api, "files": files}
     (args.out / "bundle-manifest.json").write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
     print(f"Packaged {chain} wallet at {args.out}; API {api}. No deployment or network request performed.")
